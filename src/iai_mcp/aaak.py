@@ -158,7 +158,7 @@ def enforce_language_tagged(
     *,
     detect: bool = False,
 ) -> None:
-    """D-08a constitutional: every Phase-2+ record MUST carry a language tag.
+    """Constitutional: every Phase-2+ record MUST carry a language tag.
 
     When record.language is a non-empty string, the guard passes unconditionally
     (the column is retained for legacy compatibility; the English-Only Brain
@@ -170,8 +170,8 @@ def enforce_language_tagged(
 
     When detect=True and language is empty:
     - If literal_surface is empty/whitespace, sets language="en" and returns.
-    - Else runs langdetect; if top candidate has probability >= 0.7 (D-08a
-      threshold), mutates record.language with the detected code.
+    - Else runs langdetect; if top candidate has probability >= 0.7
+      (constitutional threshold), mutates record.language with the detected code.
     - If langdetect fails or confidence < 0.7, raises ValueError.
 
     The seed for langdetect's DetectorFactory is fixed at 42 so the same text

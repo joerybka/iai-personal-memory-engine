@@ -592,8 +592,7 @@ class SleepPipeline:
     )
 
     # 3-strike threshold: the SAME step failing this many consecutive
-    # times triggers 24h auto-quarantine. Per panel verdict R3 / proposal
-    # v2 §2 L3.
+    # times triggers 24h auto-quarantine.
     _QUARANTINE_STRIKE_THRESHOLD: int = 3
 
     def run(

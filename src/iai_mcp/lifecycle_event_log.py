@@ -1,10 +1,10 @@
 """Phase 10.1 -- JSONL event log for lifecycle state machine validation.
 
-Per panel verdict R7, the lifecycle state machine needs an append-only
-event log to validate transitions in shadow-run mode and to provide a
-post-mortem trail when something misbehaves. The log is the empirical
-ground truth for "did the machine compute the right state at the right
-moment", separate from the live `lifecycle_state.json` snapshot.
+The lifecycle state machine needs an append-only event log to validate
+transitions in shadow-run mode and to provide a post-mortem trail when
+something misbehaves. The log is the empirical ground truth for "did the
+machine compute the right state at the right moment", separate from the
+live `lifecycle_state.json` snapshot.
 
 Format: JSONL (one JSON record per line), file per UTC date, kept under
 `~/.iai-mcp/logs/lifecycle-events-YYYY-MM-DD.jsonl`. Daily rotation

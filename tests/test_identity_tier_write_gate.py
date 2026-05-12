@@ -9,7 +9,7 @@ Plan 02-05 extends Plan 02-02's check_identity_anchor_on_write with:
 2. **Cross-language warning:** if the record carries a language tag that
    differs from the anchor's language (inferred via existing anchor metadata),
    emit a warning event. does not HARD BLOCK cross-lingual identity
-   updates (D-08a honours multilingual users); the warning surfaces for user
+   updates (multilingual users are supported); the warning surfaces for user
    audit via `iai-mcp audit shield` / `iai-mcp audit identity`.
 """
 from __future__ import annotations

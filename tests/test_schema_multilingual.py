@@ -1,5 +1,5 @@
-"""Tests for 02-REVIEW.md (persist_schema hardcodes language='en' --
-D-08a constitutional violation for multilingual users).
+"""Tests for persist_schema hardcoding language='en' (constitutional
+violation for multilingual users).
 
 Bug: every schema hub record was created with language='en' regardless of
 the language of the source cluster. A user storing Russian records saw
@@ -12,7 +12,7 @@ Fix:
     - persist_schema derives language from the helper; fallback 'en' only
       when evidence is empty or all evidence records are missing.
 
-Constitutional contract (D-08a native-language storage):
+Constitutional contract (native-language storage):
     Records are stored in the language they were recorded in. This extends
     to derived records (schema hubs). mandates 7+ language support;
     hardcoded 'en' broke the contract silently.

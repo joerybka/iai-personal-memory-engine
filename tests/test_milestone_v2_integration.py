@@ -327,8 +327,7 @@ def test_full_lifecycle_chain_drives_through_all_four_states(
 
     Asserts each state transition is recorded in
     ``lifecycle_state.json`` AND emitted to the lifecycle event log
-    as a ``state_transition`` entry, so the post-mortem trail (panel
-    R7 / proposal v2 §6) is intact.
+    as a ``state_transition`` entry, so the post-mortem trail is intact.
     """
     lsm = _make_lsm(integration_root)
     log = LifecycleEventLog(log_dir=integration_root / "logs")

@@ -241,7 +241,7 @@ def induce_schemas_tier1(
 def _majority_language(evidence_ids: list[UUID], store: MemoryStore) -> str:
     """Return the plurality ISO-639-1 language tag among evidence records.
 
-    fix (D-08a constitutional): schema hubs must carry the
+    Constitutional fix: schema hubs must carry the
     language of their source evidence, not a hardcoded 'en'. A user whose
     records are Russian would otherwise get schemas tagged 'en' and fail
     their own language='ru' filter at retrieval.

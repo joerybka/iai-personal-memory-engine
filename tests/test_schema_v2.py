@@ -1,7 +1,7 @@
 """Tests for MemoryRecord v2 schema extensions + edge-type enum.
 
 D-02a / / D-GUARD / D-STORAGE introduce:
-- MemoryRecord.language (ISO-639-1 required, D-08a)
+- MemoryRecord.language (ISO-639-1 required)
 - MemoryRecord.s5_trust_score (float [0,1], default 0.5, prep)
 - MemoryRecord.profile_modulation_gain (dict, runtime gain)
 - MemoryRecord.schema_version (1 or 2)

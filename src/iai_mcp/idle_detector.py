@@ -12,8 +12,8 @@ transition into a sleep cycle:
    ``Display is turned off`` within the last ``window_min`` minutes.
 
 ``sleep_eligible`` is the **disjunction** of the three: any one signal is
-sufficient. This matches the proposal v2 §2 L6 rule — there is no
-wall-clock fallback, only hardware-grounded evidence of inactivity.
+sufficient — there is no wall-clock fallback, only hardware-grounded
+evidence of inactivity.
 
 Hard constraints (carried from CONTEXT 10.4):
 - ALL subprocess calls use array form ``[bin, arg, ...]`` with
@@ -24,7 +24,7 @@ Hard constraints (carried from CONTEXT 10.4):
   lines of output rather than re-parsing the entire log.
 - macOS-only: ``ioreg`` and ``pmset`` are macOS binaries. On non-macOS the
   detector returns ``None`` / ``False`` gracefully — cross-platform support
-  is deferred per proposal v2 §6.6.
+  is deferred.
 - No new third-party dependencies — stdlib only.
 
 Validates: WAKE-09.
@@ -68,8 +68,7 @@ _HID_IDLE_RE = re.compile(r'"HIDIdleTime"\s*=\s*(\d+)')
 #: Substrings that indicate a sleep / display-off event in pmset log output.
 _PMSET_SLEEP_MARKERS = ("System Sleep", "Display is turned off")
 
-#: Default window for ``pmset_recent_sleep`` (minutes). Aligned with the
-#: proposal v2 §2 L6 wording: "in last 5 min".
+#: Default window for ``pmset_recent_sleep`` (minutes): "in last 5 min".
 _PMSET_DEFAULT_WINDOW_MIN = 5
 
 #: Hardware-idle threshold for the disjunction in ``sleep_eligible`` —

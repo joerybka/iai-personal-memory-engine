@@ -45,7 +45,7 @@ def test_crypto_roundtrip_basic() -> None:
 
 
 def test_crypto_roundtrip_cyrillic() -> None:
-    """D-08a + Russian text byte-for-byte preserved."""
+    """Russian text byte-for-byte preserved."""
     from iai_mcp.crypto import encrypt_field, decrypt_field
     key = b"\x01" * 32
     plaintext = "Привет, мир! Это тест шифрования."
@@ -57,7 +57,7 @@ def test_crypto_roundtrip_cyrillic() -> None:
 
 
 def test_crypto_roundtrip_cjk() -> None:
-    """D-08a + Japanese / Chinese round-trip."""
+    """Japanese / Chinese round-trip."""
     from iai_mcp.crypto import encrypt_field, decrypt_field
     key = b"\x02" * 32
     plaintext = "こんにちは世界。これは暗号化テストです。"
@@ -66,7 +66,7 @@ def test_crypto_roundtrip_cjk() -> None:
 
 
 def test_crypto_roundtrip_arabic() -> None:
-    """D-08a + Arabic round-trip."""
+    """Arabic round-trip."""
     from iai_mcp.crypto import encrypt_field, decrypt_field
     key = b"\x03" * 32
     plaintext = "مرحبا بالعالم. هذا اختبار تشفير."

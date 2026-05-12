@@ -136,7 +136,7 @@ def test_plist_lifecycle_env_vars_present(monkeypatch):
     """The plist defines LIFECYCLE_* + sleep-quarantine env vars.
 
     cadence knobs become production-tunable via the plist
-    EnvironmentVariables block. Defaults match proposal v2 §3.
+    EnvironmentVariables block.
     """
     fake_python = "/path/to/venv/bin/python3"
     monkeypatch.setattr("iai_mcp.cli.sys.executable", fake_python)

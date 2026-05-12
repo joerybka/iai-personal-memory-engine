@@ -1,8 +1,8 @@
 """Phase 10.1 -- typed schema + atomic load/save for lifecycle_state.json.
 
 The 4-state lifecycle (WAKE / DROWSY / SLEEP / HIBERNATION) needs a single
-source of truth on disk. Per LOCKED contract L2 (panel verdict R2), the
-daemon is the ONLY writer of `~/.iai-mcp/lifecycle_state.json`; wrappers
+source of truth on disk. Per LOCKED contract L2, the daemon is the ONLY
+writer of `~/.iai-mcp/lifecycle_state.json`; wrappers
 signal events via Unix socket OR atomic-write `~/.iai-mcp/wake.signal`
 filesystem marker.
 
