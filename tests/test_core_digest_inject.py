@@ -1,11 +1,17 @@
-"""Tests for core._inject_overnight_digest -- (DAEMON-11).
+"""Tests for core._inject_overnight_digest (DAEMON-11), updated for
+the deterministic contract.
 
 Covers 5 behaviours:
-1. First memory_recall of the day (>18h since last shown) gets overnight_digest.
-2. Second recall within <18h does NOT include overnight_digest.
-3. Empty state / no pending digest -> no overnight_digest key.
-4. Digest is cleared from state after one delivery (D-24 once-per-window).
-5. Exception in get_pending_digest does NOT break memory_recall (silent fail).
+1. First memory_recall of the day (>18h since last shown) gets the rich
+   overnight_digest payload.
+2. Second recall within <18h still includes the key, populated with the
+   zeroed default (was "key absent" pre-fix).
+3. Empty state / no pending digest -> key present with zeroed default
+   (was "key absent" pre-fix).
+4. Rich digest is cleared from state after one delivery (D-24 once-per-window).
+5. Exception in get_pending_digest does NOT break memory_recall (silent fail);
+   response still carries the zeroed-default overnight_digest key
+   (was "key absent" pre-fix).
 """
 from __future__ import annotations
 
@@ -13,6 +19,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+
+# Shared zeroed default for the deterministic contract.
+# Mirrors core._EMPTY_OVERNIGHT_DIGEST field-for-field; both must move
+# together if the schema is ever extended.
+_EMPTY_DIGEST_EXPECTED = {
+    "rem_cycles_completed": 0,
+    "episodes_processed": 0,
+    "schemas_induced_tier0": 0,
+    "claude_call_used": False,
+    "quota_used_pct": 0.0,
+    "main_insight_text": None,
+    "sigma_observed": None,
+    "s5_drift_alerts": [],
+    "daemon_uptime_hours": 0,
+    "timed_out_cycles": 0,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +51,7 @@ def isolated_state(tmp_path, monkeypatch):
     return state_path
 
 
-# digest shape -- every required field populated.
+# D-23 digest shape -- every required field populated.
 _FULL_DIGEST = {
     "rem_cycles_completed": 4,
     "episodes_processed": 10,
@@ -64,7 +87,7 @@ def test_first_recall_gets_digest(isolated_state):
 
     assert "overnight_digest" in response
     dig = response["overnight_digest"]
-    # required fields surface.
+    # D-23 required fields surface.
     assert dig["rem_cycles_completed"] == 4
     assert dig["episodes_processed"] == 10
     assert dig["schemas_induced_tier0"] == 3
@@ -82,7 +105,7 @@ def test_first_recall_gets_digest(isolated_state):
 
 
 def test_not_twice(isolated_state):
-    """the same digest must not appear twice inside the 18h window."""
+    """D-24: the same digest must not appear twice inside the 18h window."""
     from iai_mcp.core import _inject_overnight_digest
     from iai_mcp.daemon_state import save_state
 
@@ -95,11 +118,15 @@ def test_not_twice(isolated_state):
 
     response: dict = {"hits": []}
     _inject_overnight_digest(response)
-    assert "overnight_digest" not in response
+    # Deterministic contract -- inside the 18h window the
+    # key is still present but holds the zeroed default (rich payload
+    # remains gated to once-per-window).
+    assert "overnight_digest" in response
+    assert response["overnight_digest"] == _EMPTY_DIGEST_EXPECTED
 
 
 # ---------------------------------------------------------------------------
-# Test 3: no pending digest -> no key added
+# Test 3: no pending digest -> key present with zeroed default
 # ---------------------------------------------------------------------------
 
 
@@ -110,7 +137,10 @@ def test_no_digest_when_none_pending(isolated_state):
     save_state({})  # empty state
     response: dict = {"hits": []}
     _inject_overnight_digest(response)
-    assert "overnight_digest" not in response
+    # Deterministic contract -- empty state yields the
+    # zeroed default, not an absent key.
+    assert "overnight_digest" in response
+    assert response["overnight_digest"] == _EMPTY_DIGEST_EXPECTED
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +149,7 @@ def test_no_digest_when_none_pending(isolated_state):
 
 
 def test_digest_cleared_after_delivery(isolated_state):
-    """after surfacing the digest, state must no longer carry
+    """D-24: after surfacing the digest, state must no longer carry
     pending_digest so a subsequent recall (even after another 18h) does not
     re-show the stale digest."""
     from iai_mcp.core import _inject_overnight_digest
@@ -165,4 +195,8 @@ def test_exception_is_silent(isolated_state, monkeypatch):
     # Must not raise.
     core._inject_overnight_digest(response)
     assert response.get("existing") is True
-    assert "overnight_digest" not in response
+    # Deterministic contract -- even on silent-fail in
+    # the digest pipeline the key is still present, set to the zeroed
+    # default before the silent-fail event is written.
+    assert "overnight_digest" in response
+    assert response["overnight_digest"] == _EMPTY_DIGEST_EXPECTED

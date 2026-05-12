@@ -1092,29 +1092,56 @@ def _inject_sleep_suggestion(
         pass
 
 
+# Deterministic overnight_digest contract.
+# The key is ALWAYS present in memory_recall responses; this is the
+# zeroed default when daemon_state has no pending digest (or the
+# digest pipeline silent-fails). Field shape MUST match the rich-
+# payload branch inside _inject_overnight_digest so consumers see
+# one stable schema regardless of daemon REM-cycle state.
+_EMPTY_OVERNIGHT_DIGEST: dict = {
+    "rem_cycles_completed": 0,
+    "episodes_processed": 0,
+    "schemas_induced_tier0": 0,
+    "claude_call_used": False,
+    "quota_used_pct": 0.0,
+    "main_insight_text": None,
+    "sigma_observed": None,
+    "s5_drift_alerts": [],
+    "daemon_uptime_hours": 0,
+    "timed_out_cycles": 0,
+}
+
+
 def _inject_overnight_digest(response: dict, store: MemoryStore | None = None) -> None:
-    """first memory_recall of the day (>18h since shown
-    OR never shown) carries the daemon's overnight digest.
+    """Every memory_recall response carries an ``overnight_digest`` key.
 
-    The digest lives inside `.daemon-state.json`; daemon_state.get_pending_digest
-    handles the 18h timing gate and CLEARS the digest from state on delivery,
-    so subsequent recalls in the same window return naturally without the key.
+    The digest lives inside ``.daemon-state.json``;
+    ``daemon_state.get_pending_digest`` handles the 18h timing gate and
+    CLEARS the digest from state on delivery, so the rich payload still
+    surfaces exactly once per window (once-per-window invariant preserved).
 
-    required fields surfaced even when the daemon stored a partial digest
-    (missing keys default to neutral values) so downstream consumers can rely
-    on a consistent shape. The response dict is mutated in place; absence of
-    the `overnight_digest` key IS the signal that no digest is pending.
+    The ``overnight_digest`` key is ALWAYS present in the mutated response.
+    When the daemon has a pending digest within the 18h once-per-window gate,
+    the payload is the rich dict; otherwise it is ``_EMPTY_OVERNIGHT_DIGEST``
+    (structured zeros). This guarantees byte-identical top-level shape across
+    stdio and socket transports regardless of daemon timing.
 
     Silent-fail on any exception: corrupt state, disk failure, or schema drift
-    must NEVER break the memory_recall hot path. When `store` is provided, we
-    best-effort emit a `digest_inject_error` warning event so operators can
-    see that the digest pipeline failed once.
+    must NEVER break the memory_recall hot path. On exception the zeroed
+    default is still written first so determinism holds even on a daemon-
+    state IO hiccup; when ``store`` is provided, a best-effort
+    ``digest_inject_error`` warning event is emitted so operators can see
+    that the digest pipeline failed once.
     """
     try:
         state = load_state()
         now = datetime.now(timezone.utc)
         digest = get_pending_digest(state, now)
         if not digest:
+            # Deterministic contract -- key always present, zeroed default
+            # when no digest is pending. Copy to avoid sharing the module-
+            # level mutable default across responses.
+            response["overnight_digest"] = dict(_EMPTY_OVERNIGHT_DIGEST)
             return
         response["overnight_digest"] = {
             "rem_cycles_completed": digest.get("rem_cycles_completed", 0),
@@ -1129,6 +1156,10 @@ def _inject_overnight_digest(response: dict, store: MemoryStore | None = None) -
             "timed_out_cycles": digest.get("timed_out_cycles", 0),
         }
     except Exception as exc:  # noqa: BLE001 -- hot path must never break
+        # Set the zeroed default BEFORE the silent-fail event write so a
+        # daemon-state IO hiccup cannot re-introduce non-determinism in
+        # top-level response keys.
+        response["overnight_digest"] = dict(_EMPTY_OVERNIGHT_DIGEST)
         if store is not None:
             try:
                 from iai_mcp.events import write_event
