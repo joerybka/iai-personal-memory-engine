@@ -193,6 +193,7 @@ def _write_session_start_cache(store, *, cache_path: Path = SESSION_START_CACHE_
             f.write(rendered)
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, cache_path)
     except Exception as exc:  # noqa: BLE001 -- cache write MUST NOT crash the REM loop
         try:
