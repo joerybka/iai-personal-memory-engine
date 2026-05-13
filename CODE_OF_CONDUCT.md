@@ -19,3 +19,4 @@ All reports are reviewed promptly and treated as confidential. Reporters will no
 The project maintainer is responsible for clarifying and enforcing this Code of Conduct, and may take any action they deem appropriate in response to a report, up to and including a permanent ban from project spaces.
 
 Decisions are final at the maintainer's discretion. This is a small project; there is no separate enforcement committee.
+

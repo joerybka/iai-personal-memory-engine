@@ -6,3 +6,4 @@ contact_links:
   - name: Security report
     url: https://github.com/CodeAbra/iai-mcp/security/advisories/new
     about: Report a security issue privately via GitHub Security Advisories.
+
