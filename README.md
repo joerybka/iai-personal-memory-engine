@@ -82,14 +82,14 @@ export PATH="$HOME/.local/bin:$PATH"  # add to ~/.zshrc or ~/.bashrc
 iai-mcp --version
 ```
 
-### Install the capture hook
+### Install the capture + recall hooks
 
-This is what makes capture ambient. Without it you'd have to save memories by hand.
-
-Claude Code is the default target:
+This is what makes memory ambient. Without these hooks iai-mcp reads memory but never writes conversation content and never injects recall at session start. One command wires all three:
 
 ```bash
-iai-mcp capture-hooks install
+iai-mcp capture-hooks install       # copies all three hooks + patches ~/.claude/settings.json
+iai-mcp capture-hooks status        # verify: should print "status: ACTIVE"
+iai-mcp capture-hooks uninstall     # clean removal if ever needed
 ```
 
 For Codex:
@@ -104,39 +104,22 @@ To install both:
 iai-mcp capture-hooks install --target all
 ```
 
-Check status with:
+What the install does:
 
-```bash
-iai-mcp capture-hooks status --target all
-```
+- Copies three hook scripts from `deploy/hooks/` to `~/.claude/hooks/` (chmod +x):
+  - `iai-mcp-turn-capture.sh` (`UserPromptSubmit`, timeout 5s) — appends each prompt + the preceding assistant turn(s) to a per-session buffer as pure file IO. Zero daemon RPC during the session.
+  - `iai-mcp-session-capture.sh` (`Stop`, timeout 35s) — at session end, rolls the buffer over for the daemon to drain, and runs `iai-mcp capture-transcript --no-spawn` as a safety net.
+  - `iai-mcp-session-recall.sh` (`SessionStart`, timeout 30s) — calls `iai-mcp session-start` and pipes the assembled memory prefix to stdout, which Claude Code injects as `additionalContext` before the first prompt. Fail-safe: empty store or unreachable daemon yields empty stdout — session start is never blocked.
+- Registers iai-mcp in Claude Desktop's config if installed.
+- Idempotent — re-running detects existing entries and makes no changes.
+- No secrets, no tokens, no network calls.
 
-Manual Claude Code setup is equivalent to:
+What happens at runtime:
 
-```bash
-mkdir -p ~/.claude/hooks
-cp deploy/hooks/iai-mcp-session-capture.sh ~/.claude/hooks/
-chmod +x ~/.claude/hooks/iai-mcp-session-capture.sh
-```
-
-Register in `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "Stop": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$HOME/.claude/hooks/iai-mcp-session-capture.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+- **Every prompt** (per-turn hook): appends new transcript turns to the session buffer. ~5 ms per turn, no embedding, no daemon socket.
+- **Every session end** (Stop hook): rolls the buffer over, captures any remaining turns. Fail-safe exit 0.
+- **Every session start** (recall hook): assembles the cached memory prefix and pipes it to Claude. Empty store or unreachable daemon → empty stdout.
+- **When idle** (daemon): drains the buffer through the shield → embed → dedup → encrypted insert pipeline on the WAKE → DROWSY edge (5-min idle) and after every REM cycle.
 
 ### Connect your MCP host
 
@@ -304,6 +287,46 @@ What it checks:
 | n | HID idle source | Idle detection source is available |
 
 14/14 PASS is healthy. 13/14 with check (b) failing during a sleep cycle is also normal (the socket is busy during consolidation). Multiple FAILs or a FAIL on (a) or (f) means something is actually wrong.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `import lancedb` crashes with `Illegal instruction (SIGILL)` | CPU lacks AVX2 (Intel Celeron N4020, Atom, older Core2, some embedded ARM). LanceDB has no SSE-only fallback. | Deploy on a host with AVX2 and connect over SSH stdio — see [Headless / VPS deployment](#headless--vps-deployment). |
+| `keyring.errors.NoKeyringError` on first run | Storage is file-backed at `~/.iai-mcp/.crypto.key`. Older setups referenced a Keychain-only path. | `iai-mcp crypto init` (idempotent). `iai-mcp daemon install` calls this automatically on fresh installs. |
+| Daemon crashes on first start with `CryptoKeyError` | Fresh install bypassed `daemon install` (e.g. systemd unit copied manually) — no `.crypto.key` exists yet. | `iai-mcp crypto init`, then restart the daemon. |
+| `iai-mcp daemon install` says "launchd bootstrap failed" | Existing plist from previous install | `iai-mcp daemon uninstall` first, then `install` again. |
+| Daemon "active" but no tick events | First-week bootstrap (no quiet-window data yet) | Wait 2 h of MCP idle, or force: `iai-mcp daemon force-rem` |
+| Claude Code doesn't show iai-mcp tools after `claude mcp add` | Forgot to fully quit — "reload window" is not enough | `killall Claude` then relaunch. Check `~/Library/Logs/Claude/*.log` for MCP stderr. |
+
+### Headless / VPS deployment
+
+If your local CPU lacks AVX2 (Intel Celeron N4020 Gemini Lake, older Atoms, some embedded ARM) `import lancedb` will crash with `SIGILL` and the daemon can't run locally. The escape hatch is to run the daemon on a remote host (any cheap VPS with AVX2) and let Claude Code spawn the MCP wrapper over SSH stdio.
+
+On the **remote host** (Linux example):
+
+```bash
+git clone https://github.com/CodeAbra/iai-mcp.git /opt/iai-mcp
+cd /opt/iai-mcp && bash scripts/install.sh
+loginctl enable-linger "$USER"
+iai-mcp daemon install --yes
+systemctl --user status iai-mcp-daemon.service
+```
+
+On the **local host**:
+
+```bash
+claude mcp add iai-mcp -- \
+  ssh -o ConnectTimeout=5 -o ServerAliveInterval=30 \
+      user@vps.example.com \
+      node /opt/iai-mcp/mcp-wrapper/dist/index.js
+```
+
+Round-trip latency on the same continent is typically 10-50 ms per call.
+
+**Doctor caveats on headless hosts.** `iai-mcp doctor` check (n) "HID idle source" returns WARN because there is no display hardware. The daemon's wake/sleep cycle falls back to heartbeat-idle, which works correctly. Check (b) "socket" may FAIL transiently during `DREAMING` state. Both are expected.
 
 ---
 

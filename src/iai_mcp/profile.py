@@ -8,7 +8,7 @@ deep = <=2000 tok expanded rich_club). REMOVED 4 dead KnobSpec
 entries (AUTIST-02 sensory_channel_weights, event_vs_time_cue,
 AUTIST-11 alexithymia_accommodation, double_empathy) — none was
 read in any production scoring/response path; double_empathy was promoted
-to a passive system invariant in CLAUDE.md, event_vs_time_cue was documented
+to a passive system invariant, event_vs_time_cue was documented
 as a deferred future capability.
 
 Registry shape:

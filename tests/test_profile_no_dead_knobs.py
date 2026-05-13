@@ -58,7 +58,7 @@ def test_profile_set_rejects_event_vs_time_cue() -> None:
     `_apply_event_vs_time_cue` helper exists in response_decorator.py
     (the prior -05 closure claim that this knob was 'live' was
     wrong — see CONTEXT.md §Origin revised 2026-04-30). Documented as
-    a deferred future capability in CLAUDE.md.
+    a deferred future capability.
     """
     state = default_state()
     result = profile_set("event_vs_time_cue", "time", state)
@@ -77,8 +77,7 @@ def test_profile_set_rejects_alexithymia_accommodation() -> None:
 def test_profile_set_rejects_double_empathy() -> None:
     """AUTIST-12 RE-ASSERTED via removal — promoted to passive invariant.
 
-    See CLAUDE.md "Architectural Invariants — Pinned" section for the
-    project-level invariant that replaces the runtime-mutable knob.
+    Promoted to a passive system invariant that replaces the runtime-mutable knob.
     """
     state = default_state()
     result = profile_set("double_empathy", False, state)

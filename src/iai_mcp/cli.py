@@ -1,42 +1,38 @@
 """iai-mcp CLI: health + migrate + trajectory + audit + crypto + daemon.
 
-Plan 02-05 gave us `audit`. added crypto. Plan 04-05
-adds the `daemon` subcommand group.
-
 Commands:
 - `iai-mcp health`           -- print the most recent llm_health event in user-local TZ
-- `iai-mcp migrate`          -- Phase 1->2 migration OR v2->v3
-                                encryption migration (chosen by --from / --to)
+- `iai-mcp migrate`          -- schema migration (v1->v2, v2->v3 encryption,
+                                v3->v4 TEM factorization; --from / --to)
 - `iai-mcp trajectory`       -- aggregate M1..M6 trajectory events
-- `iai-mcp audit`            -- (Plan 02-05 OPS-07) identity + shield audit log
-- `iai-mcp crypto status`           -- (Plan 02-08, rewritten 07.10) file-backend key status
+- `iai-mcp audit`            -- identity + shield audit log
+- `iai-mcp crypto status`           -- file-backend key status
 - `iai-mcp crypto rotate`           -- rotate AES-256-GCM key
-- `iai-mcp crypto migrate-to-file`  -- (Plan 07.10) one-time migration from Keychain to file
-- `iai-mcp crypto init`             -- (Plan 07.10) fresh-install: generate a new key file
+- `iai-mcp crypto migrate-to-file`  -- one-time migration from Keychain to file
+- `iai-mcp crypto init`             -- fresh-install: generate a new key file
 - `iai-mcp crypto recover-with-prior-key` -- re-encrypt records after wrong-key rotation (32-byte prior key file)
 - `iai-mcp crypto redact-undecryptable` -- replace surfaces that fail decrypt with a redacted marker
-- `iai-mcp daemon install`   -- (Plan 04-05 DAEMON-10) silent install + consent
-- `iai-mcp daemon uninstall` -- C4 clean uninstall (plist/unit + 3 state files)
+- `iai-mcp daemon install`   -- silent install with first-run consent
+- `iai-mcp daemon uninstall` -- clean uninstall (plist/unit + 3 state files)
 - `iai-mcp daemon start|stop|status|logs|force-rem|pause|resume|configure`
 
 All timestamps render in the user's IANA timezone via
 `iai_mcp.tz.load_user_tz() + to_local()`. Storage remains UTC.
 
-OPS-07 audit privacy: shield match patterns are REDACTED to the MATCH COUNT
-in CLI output (T-02-05-02 info-disclosure mitigation). Full payload remains
-in the events table for forensics.
+Audit privacy: shield match patterns are REDACTED to the MATCH COUNT in CLI
+output (info-disclosure mitigation). Full payload remains in the events table
+for forensics.
 
-Constitutional guards (Plan 04-05 daemon group):
-- C3 / ZERO API costs. The paid-API env-var token is forbidden in
-  daemon-side modules; this CLI delegates LLM-aware operations to the
-  daemon process which uses `claude -p` subprocess (subscription only).
-- C4: `daemon uninstall` MUST remove plist/unit AND ~/.iai-mcp/.lock,
-  ~/.iai-mcp/.daemon.sock, ~/.iai-mcp/.daemon-state.json -- verified by
-  tests/shell/test_launchd_install.sh and tests/test_cli_daemon.py.
-- Pitfall 5 (launchd PATH): install renders the plist with absolute
+Daemon install constraints:
+- ZERO API costs. The paid-API env-var token is forbidden in daemon-side
+  modules; this CLI delegates LLM-aware operations to the daemon process
+  which uses `claude -p` subprocess (subscription only).
+- `daemon uninstall` MUST remove plist/unit AND ~/.iai-mcp/.lock,
+  ~/.iai-mcp/.daemon.sock, ~/.iai-mcp/.daemon-state.json.
+- Pitfall (launchd PATH): install renders the plist with absolute
   `sys.executable` substituted -- launchd has no PATH, relative `python3`
   would resolve to /usr/bin/python3 even if user installed in /opt/python.
-- Pitfall 8 (systemd linger): install probes `loginctl show-user --property=Linger`
+- Pitfall (systemd linger): install probes `loginctl show-user --property=Linger`
   on Linux; if Linger=no, runs `loginctl enable-linger $USER` and re-verifies.
   PAM-variant systems may silently refuse, hence the post-enable check + WARN.
 - Subprocess invocation: argv-list form ALWAYS, never shell=True. launchctl /
@@ -54,14 +50,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# R9: top-level `iai-mcp doctor` handler (D7-10 placement
-# precedent — alongside `iai-mcp schema-cleanup` rather than nested under
-# `iai-mcp daemon`). doctor.py imports the daemon-state path constants
-# lazily inside its check functions, so this top-level import is acyclic.
+# Top-level `iai-mcp doctor` handler (alongside `iai-mcp schema-cleanup`
+# rather than nested under `iai-mcp daemon`). doctor.py imports the
+# daemon-state path constants lazily inside its check functions, so this
+# top-level import is acyclic.
 from iai_mcp.doctor import cmd_doctor
 
 # ---------------------------------------------------------------------------
-# constants -- daemon CLI group
+# Daemon CLI group constants
 # ---------------------------------------------------------------------------
 
 # Re-export the daemon-side state paths so tests + uninstall can clear them
@@ -71,8 +67,8 @@ LOCK_PATH: Path = Path.home() / ".iai-mcp" / ".lock"
 SOCKET_PATH: Path = Path.home() / ".iai-mcp" / ".daemon.sock"
 STATE_PATH: Path = Path.home() / ".iai-mcp" / ".daemon-state.json"
 
-# Deploy artefact targets (Plan 04-01 created the templates; we install copies
-# into the user's per-user system-level dirs).
+# Deploy artefact targets (we install copies into the user's per-user
+# system-level dirs).
 LAUNCHD_TARGET: Path = Path.home() / "Library" / "LaunchAgents" / "com.iai-mcp.daemon.plist"
 SYSTEMD_TARGET: Path = Path.home() / ".config" / "systemd" / "user" / "iai-mcp-daemon.service"
 
@@ -84,7 +80,7 @@ SYSTEMD_TEMPLATE: Path = _PROJECT_ROOT / "deploy" / "systemd" / "iai-mcp-daemon.
 DAEMON_LABEL: str = "com.iai-mcp.daemon"
 SERVICE_NAME: str = "iai-mcp-daemon.service"
 
-# first-run consent banner. Wording cites RAM cost, Claude budget cap,
+# First-run consent banner. Wording cites RAM cost, Claude budget cap,
 # opt-out command. Aborts unless user types lowercase 'y' (strict).
 CONSENT_BANNER: str = """\
 ==============================================================================
@@ -112,7 +108,7 @@ Continue? [y/N]: """
 
 
 # ---------------------------------------------------------------------------
-# helpers
+# Daemon install helpers
 # ---------------------------------------------------------------------------
 
 def _is_macos() -> bool:
@@ -121,6 +117,25 @@ def _is_macos() -> bool:
 
 def _is_linux() -> bool:
     return platform.system() == "Linux"
+
+
+def _ensure_crypto_key_present():
+    """Idempotent: write a fresh 32-byte 0o600 key file when neither a key
+    file nor ``IAI_MCP_CRYPTO_PASSPHRASE`` is present. Returns the new path
+    or ``None`` when no work was needed.
+    """
+    if os.environ.get("IAI_MCP_CRYPTO_PASSPHRASE"):
+        return None
+    from iai_mcp.crypto import KEY_BYTES, CryptoKey
+    ck = CryptoKey(user_id="default")
+    path = ck._key_file_path()
+    if path.exists():
+        return None
+    import secrets as _secrets
+    fresh = _secrets.token_bytes(KEY_BYTES)
+    ck._try_file_set(fresh)
+    print(f"crypto: created {path} (mode 0o600, {KEY_BYTES} bytes)")
+    return path
 
 
 def _render_launchd_plist() -> str:
@@ -146,13 +161,13 @@ def _render_systemd_unit() -> str:
 
 def _try_short_timeout_connect(timeout_ms: int = 250) -> bool:
     """Probe daemon socket reachability with a hard timeout. Returns True if
-    connect succeeded. Used by ``capture-transcript --no-spawn`` (R3) to
-    decide between inline ingest vs JSONL defer — hook is best-effort and
-    must NEVER block session teardown waiting on a 5s cold-start.
+    connect succeeded. Used by ``capture-transcript --no-spawn`` to decide
+    between inline ingest vs JSONL defer — hook is best-effort and must
+    NEVER block session teardown waiting on a 5s cold-start.
 
-    Honors the ``IAI_DAEMON_SOCKET_PATH`` env override (test isolation +
-    HIGH-4 lock from Plan 07-04). Closes the probe socket immediately —
-    we never write a request, only check that connect(2) returns.
+    Honors the ``IAI_DAEMON_SOCKET_PATH`` env override for test isolation.
+    Closes the probe socket immediately — we never write a request, only
+    check that connect(2) returns.
     """
     import socket as _socket
 
@@ -172,8 +187,8 @@ def _try_short_timeout_connect(timeout_ms: int = 250) -> bool:
 
 
 def _prompt_consent(stream_out=None) -> bool:
-    """print the consent banner, read one line from stdin, return True
-    only if the response stripped + lowercased equals exactly 'y'.
+    """Print the consent banner, read one line from stdin, return True only
+    if the response stripped + lowercased equals exactly 'y'.
 
     Resolve sys.stderr at call time (NOT at module import) so pytest's capsys
     fixture can intercept the banner -- capsys swaps sys.stderr after our
@@ -191,10 +206,10 @@ def _prompt_consent(stream_out=None) -> bool:
 
 
 def _record_consent_receipt() -> None:
-    """D-10 audit trail: write a timestamped JSON receipt under
-    ~/.iai-mcp/.consent-<ts>.json so a forensic review can verify the user
-    actually consented (not bypassed via --yes). Failure to write the receipt
-    is logged to stderr but never blocks the install."""
+    """Write a timestamped JSON receipt under ~/.iai-mcp/.consent-<ts>.json
+    so a forensic review can verify the user actually consented (not bypassed
+    via --yes). Failure to write the receipt is logged to stderr but never
+    blocks the install."""
     state_dir = LOCK_PATH.parent
     state_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).isoformat()
@@ -223,6 +238,96 @@ def _remove_state_files() -> None:
             pass
         except OSError as exc:
             print(f"warning: could not remove {p}: {exc}", file=sys.stderr)
+
+
+_HOOK_TRUNCATION_TRAILER = "[... payload truncated to fit Claude Code 10000-char limit ...]"
+
+
+def _truncate_for_claude_code_hook(text: str, cap: int = 10000) -> str:
+    """Cap `text` at `cap` chars; oversized inputs end with a fixed trailer
+    so the consumer sees the truncation explicitly."""
+    if len(text) <= cap:
+        return text
+    head_len = cap - len(_HOOK_TRUNCATION_TRAILER)
+    if head_len <= 0:
+        return _HOOK_TRUNCATION_TRAILER[:cap]
+    return text[:head_len] + _HOOK_TRUNCATION_TRAILER
+
+
+def _send_jsonrpc_request(
+    method: str,
+    params: dict,
+    *,
+    connect_timeout: float = 5.0,
+    read_timeout: float = 30.0,
+) -> dict | None:
+    """One-shot JSON-RPC 2.0 request over the daemon AF_UNIX socket.
+
+    Returns the response dict on success, None on connect refused, missing
+    socket, timeout, malformed reply, or any other failure. Honors
+    `IAI_DAEMON_SOCKET_PATH` env override.
+    """
+    sock_path = os.environ.get("IAI_DAEMON_SOCKET_PATH") or str(SOCKET_PATH)
+
+    async def _runner() -> dict | None:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(sock_path),
+                timeout=connect_timeout,
+            )
+        except (FileNotFoundError, ConnectionRefusedError, OSError, asyncio.TimeoutError):
+            return None
+        try:
+            req = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+            writer.write((json.dumps(req) + "\n").encode("utf-8"))
+            await writer.drain()
+            line = await asyncio.wait_for(reader.readline(), timeout=read_timeout)
+            if not line:
+                return None
+            return json.loads(line.decode("utf-8"))
+        except Exception:
+            return None
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    try:
+        return asyncio.run(_runner())
+    except Exception:
+        return None
+
+
+def cmd_session_start(args: argparse.Namespace) -> int:
+    """Print the session-start recall payload as markdown on stdout.
+
+    Sends a JSON-RPC `session_start_payload` request to the daemon, renders
+    the four-segment response via `iai_mcp.session.format_payload_as_markdown`,
+    caps the result at 10000 characters, and writes it to stdout.
+
+    Fail-safe: empty store, daemon unreachable, malformed reply, or any
+    exception yields empty stdout and exit 0. Never blocks session start.
+    """
+    try:
+        from iai_mcp.session import format_payload_as_markdown
+        session_id = getattr(args, "session_id", "-") or "-"
+        resp = _send_jsonrpc_request(
+            "session_start_payload", {"session_id": session_id}
+        )
+        if not isinstance(resp, dict) or "result" not in resp:
+            return 0
+        result = resp.get("result")
+        if not isinstance(result, dict):
+            return 0
+        rendered = format_payload_as_markdown(result)
+        if not rendered:
+            return 0
+        sys.stdout.write(_truncate_for_claude_code_hook(rendered, cap=10000))
+        return 0
+    except Exception:
+        return 0
 
 
 def _send_socket_request(req: dict, *, timeout: float = 30.0) -> dict | None:
@@ -261,16 +366,16 @@ def _send_socket_request(req: dict, *, timeout: float = 30.0) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# daemon subcommand handlers
+# Daemon subcommand handlers
 # ---------------------------------------------------------------------------
 
 
 def cmd_daemon_install(args: argparse.Namespace) -> int:
-    """DAEMON-10 install: render plist/unit, drop into per-user system path,
-    enable via launchctl bootstrap or systemctl --user enable --now.
+    """Render plist/unit, drop into per-user system path, enable via
+    launchctl bootstrap or systemctl --user enable --now.
 
     --dry-run prints the would-be path + rendered contents and exits.
-    --yes skips the consent banner.
+    --yes skips the first-run consent banner.
     """
     dry_run = bool(getattr(args, "dry_run", False))
     yes = bool(getattr(args, "yes", False))
@@ -303,6 +408,8 @@ def cmd_daemon_install(args: argparse.Namespace) -> int:
         os.chmod(target, 0o644)
     except OSError:
         pass
+
+    _ensure_crypto_key_present()
 
     uid = os.getuid()
     if _is_macos():
@@ -363,7 +470,7 @@ def cmd_daemon_install(args: argparse.Namespace) -> int:
 
 
 def cmd_daemon_uninstall(args: argparse.Namespace) -> int:
-    """C4 invariant: clean removal of plist/unit + ALL state files."""
+    """Clean removal of plist/unit + ALL state files."""
     yes = bool(getattr(args, "yes", False))
     if not yes:
         try:
@@ -432,19 +539,17 @@ def cmd_daemon_stop(args: argparse.Namespace) -> int:
     Sends SIGTERM to the daemon via launchctl (macOS) or systemctl --user
     (Linux). The daemon exits 0 on graceful shutdown; the supervisor
     respawns only on crash via the plist's `KeepAlive.Crashed=true`
-    contract (commit 0cdc6a9). A user-initiated stop therefore takes the
-    daemon down for good — no respawn — until the user explicitly starts
-    it again.
+    contract. A user-initiated stop therefore takes the daemon down for
+    good — no respawn — until the user explicitly starts it again.
 
     As informational telemetry only, we also write a
     `user_requested_shutdown=True` sentinel to .daemon-state.json before
     sending the signal. The daemon clears the sentinel on graceful
-    shutdown via `_clear_user_shutdown_sentinel` (daemon.py:1002, called
-    from main at daemon.py:1670). The sentinel is NOT consumed for any
-    control-flow decision — it exists purely so post-mortem inspection of
-    .daemon-state.json can distinguish a user-stop from other shutdown
-    paths. The sentinel write is best-effort: a state-file failure must
-    NOT block the SIGTERM (the user explicitly wants the daemon down).
+    shutdown. The sentinel is NOT consumed for any control-flow decision —
+    it exists purely so post-mortem inspection of .daemon-state.json can
+    distinguish a user-stop from other shutdown paths. The sentinel write
+    is best-effort: a state-file failure must NOT block the SIGTERM (the
+    user explicitly wants the daemon down).
     """
     # Best-effort sentinel write: we do NOT abort on failure.
     try:
@@ -535,7 +640,7 @@ def cmd_daemon_logs(args: argparse.Namespace) -> int:
 
 
 def cmd_daemon_force_rem(args: argparse.Namespace) -> int:
-    """D-18 cooperative force: wait up to 15min for current cycle to finish."""
+    """Cooperative force: wait up to 15min for current cycle to finish."""
     try:
         resp = _send_socket_request({"type": "force_rem"}, timeout=15 * 60)
     except asyncio.TimeoutError:
@@ -581,7 +686,7 @@ def cmd_daemon_resume(args: argparse.Namespace) -> int:
 
 
 def cmd_daemon_configure(args: argparse.Namespace) -> int:
-    """per-setting overrides written to ~/.iai-mcp/.daemon-state.json.
+    """Per-setting overrides written to ~/.iai-mcp/.daemon-state.json.
 
     Subcommands:
       - set-budget <float>          -- daily_quota_pct_override
@@ -649,24 +754,22 @@ def cmd_health(args: argparse.Namespace) -> int:
 
 
 def cmd_capture_transcript(args: argparse.Namespace) -> int:
-    """Plan 06: batch-capture a Claude Code JSONL transcript into the store.
+    """Batch-capture a Claude Code JSONL transcript into the store.
 
     Called by ~/.claude/hooks/iai-mcp-session-capture.sh on Stop event.
     Fail-safe by design: any exception logs and returns 0 so the hook never
     blocks session teardown.
 
-    ``--no-spawn`` ALWAYS writes a deferred-captures JSONL file
-    under ``~/.iai-mcp/.deferred-captures/<id>-<ts>.jsonl`` (D7.1-04 format)
-    and exits 0 within 2s — NEVER spawning the daemon, NEVER importing
+    ``--no-spawn`` ALWAYS writes a deferred-captures JSONL file under
+    ``~/.iai-mcp/.deferred-captures/<id>-<ts>.jsonl`` and exits 0 within
+    2s — NEVER spawning the daemon, NEVER importing
     ``iai_mcp.capture.capture_transcript`` (which transitively loads
     ``sentence_transformers`` / bge-small-en-v1.5 in a brand-new subprocess).
-    The daemon's WAKE drain loop (Phase 7.1 R3 / Plan 07.1-06, in
-    ``daemon.main()`` startup + ``_tick_body`` head) consumes the deferred
-    file later with the daemon-process embedder that's already loaded.
+    The daemon's WAKE drain loop consumes the deferred file later with the
+    daemon-process embedder that's already loaded.
 
-    Default mode (without ``--no-spawn``) keeps inline-ingest
-    behaviour unchanged — user-explicit ``iai-mcp capture-transcript``
-    invocations still embed eagerly as documented.
+    Default mode (without ``--no-spawn``) uses inline-ingest — user-explicit
+    ``iai-mcp capture-transcript`` invocations embed eagerly.
     """
     import json
     import sys as _sys
@@ -674,12 +777,12 @@ def cmd_capture_transcript(args: argparse.Namespace) -> int:
     no_spawn = bool(getattr(args, "no_spawn", False))
 
     if no_spawn:
-        # hook is best-effort. ALWAYS defer; the 250ms socket probe
-        # and the reachable-inline branch are gone. Even when the daemon is
-        # reachable we still write the JSONL file — the daemon's WAKE drain
-        # picks it up within seconds with its already-loaded embedder, which
-        # is dramatically cheaper than cold-loading bge-small-en-v1.5 in 286+
-        # short-lived Stop-hook subprocesses per day.
+        # Hook is best-effort. ALWAYS defer; the 250ms socket probe and the
+        # reachable-inline branch are gone. Even when the daemon is reachable
+        # we still write the JSONL file — the daemon's WAKE drain picks it up
+        # within seconds with its already-loaded embedder, which is dramatically
+        # cheaper than cold-loading bge-small-en-v1.5 in many short-lived
+        # Stop-hook subprocesses per day.
         from iai_mcp.capture import write_deferred_captures
 
         try:
@@ -699,7 +802,7 @@ def cmd_capture_transcript(args: argparse.Namespace) -> int:
             )
             return 0
 
-    # Default path (no --no-spawn): existing behavior, unchanged.
+    # Default path (no --no-spawn): inline ingest.
     from iai_mcp.capture import capture_transcript
     from iai_mcp.store import MemoryStore
 
@@ -718,15 +821,80 @@ def cmd_capture_transcript(args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_capture_turn_deferred(args: argparse.Namespace) -> int:
+    """Append one event per new transcript turn to {sid}.live.jsonl.
+
+    Reads the line-count offset from ~/.iai-mcp/.capture-state/{sid}.offset,
+    skips already-seen lines, appends up to ``--max-turns-per-call`` events
+    via ``write_deferred_event``, persists the new line count atomically.
+
+    Truncation (transcript shorter than stored offset) resets offset to 0.
+    Missing transcript = no-op exit 0. Fail-safe: any exception → exit 0.
+    """
+    import sys as _sys
+
+    try:
+        from iai_mcp.capture import _parse_transcript_line, write_deferred_event
+
+        transcript = Path(args.transcript_path).expanduser()
+        if not transcript.exists():
+            return 0
+
+        state_dir = Path.home() / ".iai-mcp" / ".capture-state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        offset_path = state_dir / f"{args.session_id}.offset"
+
+        prev_offset = 0
+        if offset_path.exists():
+            try:
+                prev_offset = int(offset_path.read_text().strip() or "0")
+            except ValueError:
+                prev_offset = 0
+
+        with transcript.open() as fh:
+            all_lines = fh.readlines()
+        total = len(all_lines)
+
+        if prev_offset > total:
+            prev_offset = 0
+
+        new_lines = all_lines[prev_offset:]
+        consumed = 0
+        emitted = 0
+        max_emit = int(getattr(args, "max_turns_per_call", 200))
+        cwd = os.getcwd()
+        for line in new_lines:
+            if emitted >= max_emit:
+                break
+            consumed += 1
+            parsed = _parse_transcript_line(line)
+            if parsed is None:
+                continue
+            role, text = parsed
+            write_deferred_event(args.session_id, role, text, cwd=cwd)
+            emitted += 1
+
+        new_offset = prev_offset + consumed
+        tmp_path = offset_path.parent / (offset_path.name + ".tmp")
+        tmp_path.write_text(str(new_offset))
+        os.replace(tmp_path, offset_path)
+        return 0
+    except Exception as e:
+        print(
+            f"capture-turn-deferred: failed {type(e).__name__}: {e}",
+            file=_sys.stderr,
+        )
+        return 0
+
+
 # ---------------------------------------------------------------------------
-# Plan 06 capture-hooks installer (makes ambient WRITE-capture portable).
+# Capture-hooks installer (makes ambient WRITE-capture portable).
 # ---------------------------------------------------------------------------
 
 def _capture_hook_paths() -> tuple[Path, Path, Path]:
     """Return (hook_src_in_repo, hook_dst_in_home, settings_path)."""
     from pathlib import Path as _P
     import iai_mcp
-
     pkg_dir = _P(iai_mcp.__file__).resolve().parent
     # repo layout: <repo>/src/iai_mcp/cli.py -> <repo>/deploy/hooks/...
     repo_root = pkg_dir.parent.parent
@@ -736,17 +904,15 @@ def _capture_hook_paths() -> tuple[Path, Path, Path]:
     return src, dst, settings
 
 
-def _codex_capture_hook_paths() -> tuple[Path, Path, Path]:
-    """Return (hook_src_in_repo, hook_dst_in_home, codex_hooks_json)."""
+def _turn_hook_paths() -> tuple[Path, Path]:
+    """Return (turn_hook_src_in_repo, turn_hook_dst_in_home)."""
     from pathlib import Path as _P
     import iai_mcp
-
     pkg_dir = _P(iai_mcp.__file__).resolve().parent
     repo_root = pkg_dir.parent.parent
-    src = repo_root / "deploy" / "hooks" / "iai-mcp-codex-session-capture.sh"
-    dst = _P.home() / ".codex" / "hooks" / "iai-mcp-codex-session-capture.sh"
-    settings = _P.home() / ".codex" / "hooks.json"
-    return src, dst, settings
+    src = repo_root / "deploy" / "hooks" / "iai-mcp-turn-capture.sh"
+    dst = _P.home() / ".claude" / "hooks" / "iai-mcp-turn-capture.sh"
+    return src, dst
 
 
 def _claude_desktop_config_path() -> Path | None:
@@ -831,7 +997,7 @@ def _patch_claude_desktop_config(action: str) -> str:
             servers.pop("iai-mcp", None)
             cfg_path.write_text(_json.dumps(data, indent=2))
             return f"Claude Desktop: removed iai-mcp from {cfg_path}"
-        return "Claude Desktop: iai-mcp not in config — no change"
+        return f"Claude Desktop: iai-mcp not in config — no change"
 
     # install
     new_entry = _build_iai_mcp_server_entry(repo_root)
@@ -843,7 +1009,21 @@ def _patch_claude_desktop_config(action: str) -> str:
 
 
 _CAPTURE_HOOK_MARKER = "iai-mcp-session-capture.sh"
-_CODEX_CAPTURE_HOOK_MARKER = "iai-mcp-codex-session-capture.sh"
+_TURN_HOOK_MARKER = "iai-mcp-turn-capture.sh"
+_SESSION_RECALL_HOOK_MARKER = "iai-mcp-session-recall.sh"
+
+
+def _session_recall_hook_paths() -> tuple[Path, Path, Path]:
+    """Return (hook_src_in_repo, hook_dst_in_home, settings_path) for the
+    SessionStart recall hook. Mirrors `_capture_hook_paths` semantics."""
+    from pathlib import Path as _P
+    import iai_mcp
+    pkg_dir = _P(iai_mcp.__file__).resolve().parent
+    repo_root = pkg_dir.parent.parent
+    src = repo_root / "deploy" / "hooks" / "iai-mcp-session-recall.sh"
+    dst = _P.home() / ".claude" / "hooks" / "iai-mcp-session-recall.sh"
+    settings = _P.home() / ".claude" / "settings.json"
+    return src, dst, settings
 
 
 def _load_settings(path):
@@ -856,125 +1036,21 @@ def _load_settings(path):
         return {}
 
 
-def _target_from_args(args: argparse.Namespace) -> str:
-    return str(getattr(args, "target", "claude") or "claude")
-
-
-def _target_includes(target: str, name: str) -> bool:
-    return target == "all" or target == name
-
-
-def _patch_codex_hooks_config(action: str, command: str | None = None) -> str:
-    """Install/uninstall the Codex Stop hook in ~/.codex/hooks.json."""
-    import json as _json
-
-    _, dst, settings = _codex_capture_hook_paths()
-    data = _load_settings(settings)
-    if not isinstance(data, dict):
-        data = {}
-    hooks = data.setdefault("hooks", {})
-    stop_list = hooks.setdefault("Stop", [])
-
-    def has_marker(entry: dict) -> bool:
-        return any(
-            _CODEX_CAPTURE_HOOK_MARKER in (h.get("command") or "")
-            for h in (entry.get("hooks") or [])
-        )
-
-    if action == "uninstall":
-        kept = [entry for entry in stop_list if not has_marker(entry)]
-        if len(kept) == len(stop_list):
-            return f"Codex: no Stop entry to remove in {settings}"
-        if kept:
-            hooks["Stop"] = kept
-        else:
-            hooks.pop("Stop", None)
-        if not hooks:
-            data.pop("hooks", None)
-        settings.write_text(_json.dumps(data, indent=2))
-        return f"Codex: patched {settings} (Stop hook removed)"
-
-    if any(has_marker(entry) for entry in stop_list):
-        return f"Codex: {settings} already has Stop hook - no change"
-
-    stop_list.append({
-        "matcher": "",
-        "hooks": [{
-            "type": "command",
-            "command": command or f"bash {dst}",
-            "timeout": 35,
-        }],
-    })
-    settings.parent.mkdir(parents=True, exist_ok=True)
-    settings.write_text(_json.dumps(data, indent=2))
-    return f"Codex: patched {settings} (Stop hook registered)"
-
-
-def _install_codex_capture_hook() -> int:
-    """Install the Codex Stop hook without touching Claude config."""
-    import shlex
-    import shutil
-    import stat
-
-    src, dst, _settings = _codex_capture_hook_paths()
-    if not src.exists():
-        print(f"ERROR: hook template missing in repo: {src}", file=sys.stderr)
-        return 1
-
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-    dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
-    print(f"Codex: installed {dst}")
-    print(_patch_codex_hooks_config("install", f"bash {shlex.quote(str(dst))}"))
-    return 0
-
-
-def _uninstall_codex_capture_hook() -> int:
-    """Remove the Codex Stop hook script and config entry."""
-    _, dst, _settings = _codex_capture_hook_paths()
-    if dst.exists():
-        dst.unlink()
-        print(f"Codex: removed {dst}")
-    else:
-        print(f"Codex: not present {dst}")
-    print(_patch_codex_hooks_config("uninstall"))
-    return 0
-
-
-def _codex_capture_hook_status() -> bool:
-    """Print and return whether the Codex Stop hook is installed and wired."""
-    src, dst, settings = _codex_capture_hook_paths()
-    print(f"Codex template: {src}  {'PRESENT' if src.exists() else 'MISSING'}")
-    print(f"Codex installed: {dst}  {'PRESENT' if dst.exists() else 'MISSING'}")
-    data = _load_settings(settings)
-    stop_list = data.get("hooks", {}).get("Stop", [])
-    wired = any(
-        any(_CODEX_CAPTURE_HOOK_MARKER in (h.get("command") or "")
-            for h in (entry.get("hooks") or []))
-        for entry in stop_list
-    )
-    print(f"Codex hooks.json: {settings}  {'WIRED' if wired else 'NOT WIRED'}")
-    return dst.exists() and wired
-
-
 def cmd_capture_hooks_install(args: argparse.Namespace) -> int:
-    """Copy the Stop hook into ~/.claude/hooks/ and register it in settings.json."""
+    """Copy both hook scripts into ~/.claude/hooks/ and register Stop +
+    UserPromptSubmit entries in settings.json. Idempotent on re-run."""
     import json as _json
     import shutil
     import stat
-
-    target = _target_from_args(args)
-    if _target_includes(target, "codex") and _install_codex_capture_hook() != 0:
-        return 1
-    if not _target_includes(target, "claude"):
-        print("\nNext: restart Codex so it picks up the hook registration.")
-        print("If hooks are disabled by policy, enable [features].hooks = true.")
-        print("Verify: iai-mcp capture-hooks status --target codex")
-        return 0
 
     src, dst, settings = _capture_hook_paths()
+    turn_src, turn_dst = _turn_hook_paths()
+
     if not src.exists():
         print(f"ERROR: hook template missing in repo: {src}", file=sys.stderr)
+        return 1
+    if not turn_src.exists():
+        print(f"ERROR: turn-hook template missing in repo: {turn_src}", file=sys.stderr)
         return 1
 
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -982,74 +1058,147 @@ def cmd_capture_hooks_install(args: argparse.Namespace) -> int:
     dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
     print(f"installed: {dst}")
 
+    shutil.copy2(turn_src, turn_dst)
+    turn_dst.chmod(turn_dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+    print(f"installed: {turn_dst}")
+
     settings.parent.mkdir(parents=True, exist_ok=True)
     data = _load_settings(settings)
     data.setdefault("hooks", {})
     stop_list = data["hooks"].setdefault("Stop", [])
+    submit_list = data["hooks"].setdefault("UserPromptSubmit", [])
 
     hook_cmd = f"bash {dst}"
-    # Idempotent: skip if an identical command is already wired up.
-    already = any(
+    turn_cmd = f"bash {turn_dst}"
+
+    already_stop = any(
         any(_CAPTURE_HOOK_MARKER in (h.get("command") or "")
             for h in (entry.get("hooks") or []))
         for entry in stop_list
     )
-    if already:
-        print("settings.json already has Stop hook — no change")
+    if already_stop:
+        print(f"settings.json already has Stop hook — no change")
     else:
         stop_list.append({"hooks": [{"type": "command", "command": hook_cmd, "timeout": 35}]})
-        settings.write_text(_json.dumps(data, indent=2))
         print(f"patched: {settings} (Stop hook registered)")
+
+    already_turn = any(
+        any(_TURN_HOOK_MARKER in (h.get("command") or "")
+            for h in (entry.get("hooks") or []))
+        for entry in submit_list
+    )
+    if already_turn:
+        print(f"settings.json already has UserPromptSubmit hook — no change")
+    else:
+        submit_list.append({"hooks": [{"type": "command", "command": turn_cmd, "timeout": 5}]})
+        print(f"patched: {settings} (UserPromptSubmit hook registered)")
+
+    src_recall, dst_recall, _ = _session_recall_hook_paths()
+    if src_recall.exists():
+        dst_recall.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_recall, dst_recall)
+        dst_recall.chmod(dst_recall.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+        print(f"installed: {dst_recall}")
+
+        ss_list = data["hooks"].setdefault("SessionStart", [])
+        recall_cmd = f"bash {dst_recall}"
+        already_recall = any(
+            any(_SESSION_RECALL_HOOK_MARKER in (h.get("command") or "")
+                for h in (entry.get("hooks") or []))
+            for entry in ss_list
+        )
+        if already_recall:
+            print("settings.json already has SessionStart hook — no change")
+        else:
+            ss_list.append({
+                "matcher": "startup|resume|clear|compact",
+                "hooks": [{"type": "command", "command": recall_cmd, "timeout": 30}],
+            })
+            print(f"patched: {settings} (SessionStart hook registered)")
+    else:
+        print(f"WARN: recall hook template missing in repo: {src_recall}")
+
+    settings.write_text(_json.dumps(data, indent=2))
 
     # Claude Desktop is a separate app with its own mcpServers config —
     # register iai-mcp there too so ambient memory works for BOTH surfaces.
     desktop_msg = _patch_claude_desktop_config("install")
     print(desktop_msg)
 
-    if _target_includes(target, "codex"):
-        print("\nNext: restart Codex, Claude Code, and Claude Desktop.")
-        print("If Codex hooks are disabled by policy, enable [features].hooks = true.")
-    else:
-        print("\nNext: fully quit + relaunch Claude Code AND Claude Desktop")
-        print("      so both pick up the registration (macOS: `killall Claude`).")
+    print("\nNext: fully quit + relaunch Claude Code AND Claude Desktop")
+    print("      so both pick up the registration (macOS: `killall Claude`).")
     print("Verify: iai-mcp capture-hooks status")
     return 0
 
 
 def cmd_capture_hooks_uninstall(args: argparse.Namespace) -> int:
-    """Remove the Stop hook script and its settings.json entry (idempotent)."""
+    """Remove all three hook scripts and their settings.json entries
+    (idempotent)."""
     import json as _json
 
-    target = _target_from_args(args)
-    if _target_includes(target, "codex"):
-        _uninstall_codex_capture_hook()
-    if not _target_includes(target, "claude"):
-        return 0
-
     _, dst, settings = _capture_hook_paths()
+    _, turn_dst = _turn_hook_paths()
+    _, dst_recall, _ = _session_recall_hook_paths()
+
     if dst.exists():
         dst.unlink()
         print(f"removed: {dst}")
     else:
         print(f"(not present) {dst}")
 
+    if turn_dst.exists():
+        turn_dst.unlink()
+        print(f"removed: {turn_dst}")
+    else:
+        print(f"(not present) {turn_dst}")
+
+    if dst_recall.exists():
+        dst_recall.unlink()
+        print(f"removed: {dst_recall}")
+    else:
+        print(f"(not present) {dst_recall}")
+
     if settings.exists():
         data = _load_settings(settings)
-        stop_list = data.get("hooks", {}).get("Stop", [])
-        kept = [
-            entry for entry in stop_list
-            if not any(_CAPTURE_HOOK_MARKER in (h.get("command") or "")
+        changed = False
+        for key, marker in (
+            ("Stop", _CAPTURE_HOOK_MARKER),
+            ("UserPromptSubmit", _TURN_HOOK_MARKER),
+        ):
+            entries = data.get("hooks", {}).get(key, [])
+            kept = [
+                entry for entry in entries
+                if not any(marker in (h.get("command") or "")
+                           for h in (entry.get("hooks") or []))
+            ]
+            if len(kept) != len(entries):
+                if kept:
+                    data["hooks"][key] = kept
+                else:
+                    data["hooks"].pop(key, None)
+                changed = True
+                print(f"patched: {settings} ({key} entry removed)")
+        if changed:
+            settings.write_text(_json.dumps(data, indent=2))
+        else:
+            print(f"(no hook entry to remove) {settings}")
+
+        data = _load_settings(settings)
+        ss_list = data.get("hooks", {}).get("SessionStart", [])
+        kept_ss = [
+            entry for entry in ss_list
+            if not any(_SESSION_RECALL_HOOK_MARKER in (h.get("command") or "")
                        for h in (entry.get("hooks") or []))
         ]
-        if len(kept) != len(stop_list):
-            if kept:
-                data["hooks"]["Stop"] = kept
+        if len(kept_ss) != len(ss_list):
+            if kept_ss:
+                data["hooks"]["SessionStart"] = kept_ss
             else:
-                data["hooks"].pop("Stop", None)
+                data["hooks"].pop("SessionStart", None)
             settings.write_text(_json.dumps(data, indent=2))
-            print(f"patched: {settings} (Stop entry removed)")
+            print(f"patched: {settings} (SessionStart entry removed)")
         else:
-            print(f"(no Stop entry to remove) {settings}")
+            print(f"(no SessionStart entry to remove) {settings}")
 
     # Also unregister from Claude Desktop config.
     desktop_msg = _patch_claude_desktop_config("uninstall")
@@ -1059,32 +1208,42 @@ def cmd_capture_hooks_uninstall(args: argparse.Namespace) -> int:
 
 
 def cmd_capture_hooks_status(args: argparse.Namespace) -> int:
-    """Show whether the Stop hook is installed and active on both surfaces."""
+    """Show whether all three hooks (Stop / UserPromptSubmit / SessionStart)
+    are installed and active on both surfaces."""
     import json as _json
-
-    target = _target_from_args(args)
-    codex_ok = True
-    if _target_includes(target, "codex"):
-        codex_ok = _codex_capture_hook_status()
-        if not _target_includes(target, "claude"):
-            if codex_ok:
-                print("\nstatus: ACTIVE - Codex ambient capture will fire on Stop")
-                return 0
-            print("\nstatus: INACTIVE - Codex not fully wired. Run: iai-mcp capture-hooks install --target codex")
-            return 1
-
     src, dst, settings = _capture_hook_paths()
-    print(f"repo template: {src}  {'PRESENT' if src.exists() else 'MISSING'}")
-    print(f"installed at:  {dst}  {'PRESENT' if dst.exists() else 'MISSING'}")
+    turn_src, turn_dst = _turn_hook_paths()
+    src_recall, dst_recall, _ = _session_recall_hook_paths()
+
+    print(f"Stop template:        {src}  {'PRESENT' if src.exists() else 'MISSING'}")
+    print(f"Stop installed:       {dst}  {'PRESENT' if dst.exists() else 'MISSING'}")
+    print(f"Turn template:        {turn_src}  {'PRESENT' if turn_src.exists() else 'MISSING'}")
+    print(f"Turn installed:       {turn_dst}  {'PRESENT' if turn_dst.exists() else 'MISSING'}")
+    print(f"Recall template:      {src_recall}  {'PRESENT' if src_recall.exists() else 'MISSING'}")
+    print(f"Recall installed:     {dst_recall}  {'PRESENT' if dst_recall.exists() else 'MISSING'}")
 
     data = _load_settings(settings)
     stop_list = data.get("hooks", {}).get("Stop", [])
+    submit_list = data.get("hooks", {}).get("UserPromptSubmit", [])
     wired = any(
         any(_CAPTURE_HOOK_MARKER in (h.get("command") or "")
             for h in (entry.get("hooks") or []))
         for entry in stop_list
     )
-    print(f"Claude Code settings.json: {settings}  {'WIRED' if wired else 'NOT WIRED'}")
+    turn_wired = any(
+        any(_TURN_HOOK_MARKER in (h.get("command") or "")
+            for h in (entry.get("hooks") or []))
+        for entry in submit_list
+    )
+    ss_list = data.get("hooks", {}).get("SessionStart", [])
+    recall_wired = any(
+        any(_SESSION_RECALL_HOOK_MARKER in (h.get("command") or "")
+            for h in (entry.get("hooks") or []))
+        for entry in ss_list
+    )
+    print(f"Claude Code settings.json Stop:             {settings}  {'WIRED' if wired else 'NOT WIRED'}")
+    print(f"Claude Code settings.json UserPromptSubmit: {settings}  {'WIRED' if turn_wired else 'NOT WIRED'}")
+    print(f"Claude Code settings.json SessionStart:     {settings}  {'WIRED' if recall_wired else 'NOT WIRED'}")
 
     # Claude Desktop (separate config file, separate app).
     desktop_cfg = _claude_desktop_config_path()
@@ -1104,21 +1263,23 @@ def cmd_capture_hooks_status(args: argparse.Namespace) -> int:
             desktop_wired = False
     print(desktop_line)
 
-    ok = dst.exists() and wired
+    ok = (
+        dst.exists() and wired
+        and turn_dst.exists() and turn_wired
+        and dst_recall.exists() and recall_wired
+    )
     # Desktop wiring is a bonus, not a requirement — if Desktop isn't
     # installed there's no surface to wire up. Only flag INACTIVE when
     # Desktop IS installed but not wired.
     desktop_problem = desktop_cfg is not None and desktop_cfg.exists() and not desktop_wired
 
-    if ok and not desktop_problem and codex_ok:
-        print(f"\nstatus: ACTIVE — ambient capture will fire on every Stop event "
+    if ok and not desktop_problem:
+        print(f"\nstatus: ACTIVE — Stop + UserPromptSubmit + SessionStart hooks wired "
               f"(Claude Code{'; Desktop also wired' if desktop_wired else ''})")
         return 0
     msg = []
     if not ok:
         msg.append("Claude Code not fully wired")
-    if not codex_ok:
-        msg.append("Codex not fully wired")
     if desktop_problem:
         msg.append("Claude Desktop present but iai-mcp not registered")
     print(f"\nstatus: INACTIVE — {'; '.join(msg)}. Run: iai-mcp capture-hooks install")
@@ -1127,28 +1288,25 @@ def cmd_capture_hooks_status(args: argparse.Namespace) -> int:
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     """Run the appropriate migration based on --from / --to version pair,
-    OR a Plan 07.11-03 / crash-safe-reembed action (--resume / --rollback).
+    or a crash-safe-reembed action (--resume / --rollback).
 
     Supported:
-      --from=1 --to=2   -> Phase 2
-      --from=2 --to=3   encryption-at-rest migration
-      --from=3 --to=4   TEM factorization
-      --rollback        Plan 07.11-03 drop records_v_new and (if needed)
-                        restore records from records_old_<ts>. Routes to
-                        migrate._rollback. Exit codes: 0 success, 1 user-
-                        correctable error, 2 unrecoverable.
-      --resume          Plan 07.11-03 continue an interrupted reembed
-                        migration from migration_progress.json. Routes to
-                        migrate._resume with the live store's embedder.
-                        Same exit-code contract.
+      --from=1 --to=2   v1 -> v2 schema migration
+      --from=2 --to=3   v2 -> v3 encryption-at-rest migration
+      --from=3 --to=4   v3 -> v4 TEM factorization
+      --rollback        drop records_v_new and (if needed) restore records
+                        from records_old_<ts>. Exit codes: 0 success,
+                        1 user-correctable error, 2 unrecoverable.
+      --resume          continue an interrupted reembed migration from
+                        migration_progress.json. Same exit-code contract.
 
     Anything else returns exit code 2 with a clear error message.
     """
     from iai_mcp.store import MemoryStore
     store = MemoryStore()
 
-    # Plan 07.11-03 / rollback / resume entry points. Mutually exclusive
-    # with the --from/--to dispatch below; checked first so they short-circuit.
+    # Rollback / resume entry points. Mutually exclusive with the --from/--to
+    # dispatch below; checked first so they short-circuit.
     if bool(getattr(args, "rollback", False)):
         from iai_mcp import migrate
         return migrate._rollback(store.db, store)
@@ -1198,9 +1356,9 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         return 0
 
     if from_v == 3 and to_v == 4:
-        # CONN-05: TEM factorization migration. Renames the
-        # legacy `hd_vector_json` (pa.string()) column to `structure_hv`
-        # (pa.binary()) and backfills every row via tem.bind_structure().
+        # TEM factorization migration. Renames the legacy `hd_vector_json`
+        # (pa.string()) column to `structure_hv` (pa.binary()) and backfills
+        # every row via tem.bind_structure().
         from iai_mcp.migrate import migrate_hd_vector_to_structure_hv_v3_to_v4
         result = migrate_hd_vector_to_structure_hv_v3_to_v4(
             store, dry_run=dry_run, progress=_progress
@@ -1216,15 +1374,15 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
     print(
         f"unsupported migration --from={from_v} --to={to_v}; "
-        f"supported: 1->2 (Plan 02-01 schema), 2->3 (Plan 02-08 encryption), "
-        f"3->4 (Plan 03-01 TEM factorization)",
+        f"supported: 1->2 (schema), 2->3 (encryption), "
+        f"3->4 (TEM factorization)",
         file=sys.stderr,
     )
     return 2
 
 
 def cmd_crypto_status(args: argparse.Namespace) -> int:
-    """Phase 07.10 report file-backend key state (no keyring mention).
+    """Report file-backend key state.
 
     Output is a single JSON document with the file-backend invariants:
       - backend = "file"
@@ -1234,10 +1392,9 @@ def cmd_crypto_status(args: argparse.Namespace) -> int:
       - uid + uid_matches_process flag
       - length_bytes + length_valid (== KEY_BYTES)
       - passphrase_fallback_set (whether IAI_MCP_CRYPTO_PASSPHRASE is set)
-      - hint when the file is missing (D-04 dual-remediation message)
+      - hint when the file is missing
 
-    Never prints the key bytes (D-09 information-disclosure mitigation).
-    No "keyring" string in the output (D-09 — keyring backend retired).
+    Never prints the key bytes.
     """
     import json as _json
     import os as _os
@@ -1286,18 +1443,16 @@ def cmd_crypto_status(args: argparse.Namespace) -> int:
 
 
 def cmd_crypto_rotate(args: argparse.Namespace) -> int:
-    """Plan 02-08 (Phase 07.10 update): rotate the encryption key +
-    re-encrypt every record.
+    """Rotate the encryption key and re-encrypt every record.
 
     Flow:
     1. Load current key + decrypt all records into in-memory MemoryRecord list.
     2. Rotate the key file (writes a fresh 32 bytes via _try_file_set, atomic
-       temp+rename, mode 0o600). also invalidates the cached
-       AESGCM bound to the old key (Phase 07.7 store.py:391 cached_property)
-       so subsequent encrypts use the fresh key.
+       temp+rename, mode 0o600). Also invalidates the cached AESGCM bound to
+       the old key so subsequent encrypts use the fresh key.
     3. Re-encrypt every record with the new key via a delete+insert cycle.
 
-    Events data_json is also re-encrypted (mirrors v2->v3 behaviour).
+    Events data_json is also re-encrypted.
     """
     import json as _json
 
@@ -1335,10 +1490,9 @@ def cmd_crypto_rotate(args: argparse.Namespace) -> int:
     # 2) Rotate the key (this flips store._crypto_key via wrapper cache).
     new_key = store._crypto_key_wrapper.rotate()
     store._crypto_key = new_key  # Force subsequent encrypts under the fresh key.
-    # invalidate the cached AESGCM bound to the old key
-    # (Phase 07.7 cached_property at store.py:391). Without this, the next
-    # encrypt would use AESGCM(old_key) and produce ciphertext that cannot
-    # be decrypted under new_key.
+    # Invalidate the cached AESGCM bound to the old key. Without this, the
+    # next encrypt would use AESGCM(old_key) and produce ciphertext that
+    # cannot be decrypted under new_key.
     store._invalidate_aesgcm_cache()
 
     # 3) Re-encrypt every record via delete + insert (MVCC-safe).
@@ -1455,7 +1609,7 @@ def cmd_crypto_redact_undecryptable(args: argparse.Namespace) -> int:
 
 
 def cmd_crypto_migrate_to_file(args: argparse.Namespace) -> int:
-    """Phase 07.10 one-time migration from macOS Keychain to file backend.
+    """One-time migration from macOS Keychain to file backend.
 
     Reads the existing key from the macOS Keychain (the call that hangs in
     launchd context — this command MUST be run from an interactive Terminal
@@ -1463,9 +1617,9 @@ def cmd_crypto_migrate_to_file(args: argparse.Namespace) -> int:
     writes it to ``{store_root}/.crypto.key``, verifies a round-trip read.
 
     Idempotent: a valid existing file is a no-op success that does NOT touch
-    keyring (D-08, case 9). If the file exists but is malformed, the
-    command refuses with a clear error pointing at the file path; user must
-    remove the file manually before retrying.
+    keyring. If the file exists but is malformed, the command refuses with a
+    clear error pointing at the file path; user must remove the file manually
+    before retrying.
 
     Default ``--keep-keychain`` leaves the keyring entry in place (lower-risk
     default; user can manually delete via Keychain Access.app).
@@ -1491,8 +1645,8 @@ def cmd_crypto_migrate_to_file(args: argparse.Namespace) -> int:
 
     ck = CryptoKey(user_id=user_id)
 
-    # Idempotent path (D-08, case 9): if the file is already valid, exit
-    # 0 without touching keyring.
+    # Idempotent path: if the file is already valid, exit 0 without touching
+    # keyring.
     try:
         existing = ck._try_file_get()
     except CryptoKeyError as exc:
@@ -1597,11 +1751,11 @@ def cmd_crypto_migrate_to_file(args: argparse.Namespace) -> int:
 
 
 def cmd_crypto_init(args: argparse.Namespace) -> int:
-    """Phase 07.10 generate a fresh ``.crypto.key`` (fresh installs only).
+    """Generate a fresh ``.crypto.key`` (fresh installs only).
 
     Refuses if the file already exists (any state, valid or malformed). The
-    ONLY code path in the project that creates a fresh key — daemon
-    refusal-to-start explicitly forbids silent key generation.
+    ONLY code path in the project that creates a fresh key — the daemon
+    explicitly forbids silent key generation at startup.
 
     To rotate an existing key, use ``iai-mcp crypto rotate``. To wipe and
     start over, the user must remove the file manually before re-running
@@ -1629,7 +1783,7 @@ def cmd_crypto_init(args: argparse.Namespace) -> int:
 
 
 def cmd_topology(args: argparse.Namespace) -> int:
-    """Plan 03-02 CONN-07: print live small-world topology snapshot.
+    """Print live small-world topology snapshot.
 
     One key:value line per metric:
 
@@ -1641,9 +1795,9 @@ def cmd_topology(args: argparse.Namespace) -> int:
         N: <node count>
         regime: <"developmental" | "mid_life_drift" | "healthy" | "insufficient_data">
 
-    sigma is a CYBERNETIC DIAGNOSTIC; never a routing decision (constitutional
-    guard). The CLI is a print-only command -- no event writes,
-    no state mutation. compute_and_emit() runs in S4's offline pass instead
+    sigma is a diagnostic metric only; never a routing decision. The CLI is a
+    print-only command -- no event writes, no state mutation.
+    compute_and_emit() runs in S4's offline pass instead
     (see `iai_mcp.s4.run_offline_pass`).
     """
     from iai_mcp.retrieve import build_runtime_graph
@@ -1672,7 +1826,7 @@ def cmd_topology(args: argparse.Namespace) -> int:
 
 
 def cmd_trajectory(args: argparse.Namespace) -> int:
-    """Aggregate M1..M6 trajectory events (D-32, OPS-08, Plan 02-04)."""
+    """Aggregate M1..M6 trajectory events."""
     from datetime import datetime, timedelta, timezone
 
     from iai_mcp.store import MemoryStore
@@ -1705,9 +1859,9 @@ def cmd_trajectory(args: argparse.Namespace) -> int:
 def _redact_shield_data(data: dict) -> str:
     """Render a shield event's data dict with matched-pattern redaction.
 
-    T-02-05-02: shield_rejection / shield_flag events store the matched
-    patterns. CLI output shows ONLY the count to avoid leaking the shield's
-    signal-word dictionary to attackers inspecting logs.
+    Shield_rejection / shield_flag events store the matched patterns. CLI
+    output shows ONLY the count to avoid leaking the shield's signal-word
+    dictionary to attackers inspecting logs.
     """
     matched = data.get("matched") or []
     tier = data.get("tier", "-")
@@ -1834,19 +1988,15 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
 
 def cmd_schema_cleanup(args: argparse.Namespace) -> int:
-    """Plan 06-05 R8: schema-cleanup CLI dispatch.
+    """Schema-cleanup CLI dispatch.
 
-    Soft-deletes duplicate schema records that accumulated in production
-    stores BEFORE made `persist_schema` idempotent.
-
-    Default mode is --dry-run (Beer VSM S2 anti-oscillation reversibility).
-    --apply requires the explicit flag; no interactive prompts so the
-    flow is reproducible and testable.
+    Soft-deletes duplicate schema records. Default mode is --dry-run
+    (reversible). --apply requires the explicit flag; no interactive prompts
+    so the flow is reproducible and testable.
 
     `--store-path` targets the IAI root directory (the path passed to
     MemoryStore() — contains the `lancedb/` subdir with the actual tables).
-    Default is ~/.iai-mcp (matches MemoryStore() no-args default per
-    DEFAULT_STORAGE_PATH).
+    Default is ~/.iai-mcp.
     """
     from iai_mcp.migrate import cleanup_schema_duplicates
     from iai_mcp.store import MemoryStore
@@ -1893,19 +2043,18 @@ def cmd_schema_cleanup(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Plan 07.14-01 one-shot LanceDB compaction CLI
+# One-shot LanceDB compaction CLI
 # ---------------------------------------------------------------------------
 #
-# Root-cause fix for the runaway records.lance version-manifest pile that
-# dominates daemon cold-start time. Re-uses the existing
+# Addresses the runaway records.lance version-manifest pile that can dominate
+# daemon cold-start time. Re-uses the existing
 # `optimize_lance_storage(retention=timedelta(days=0))` helper from
-# `iai_mcp.maintenance` (D7.3-09 never-raises contract) wrapped in:
+# `iai_mcp.maintenance` wrapped in:
 #   - daemon-stopped pre-flight (psutil cmdline check rules out PID-recycle)
-#   - record-id set equality assertion (verbatim-recall invariant; #2)
-#   - audit JSON trail (UTC ISO timestamp; mirrors `.consent-{ts}.json` shape)
+#   - record-id set equality assertion (verbatim-recall invariant)
+#   - audit JSON trail (UTC ISO timestamp)
 #
-# This CLI runs WITH DAEMON STOPPED, so `_should_yield_to_mcp` is irrelevant
-# (D-05 #1). Per #4 the optimize call is pure storage compaction —
+# Runs WITH DAEMON STOPPED. The optimize call is pure storage compaction —
 # never reads or paraphrases stored `literal_surface`.
 # ---------------------------------------------------------------------------
 
@@ -1914,11 +2063,11 @@ def _maintenance_compact_preflight_daemon_alive() -> str | None:
     """Return None if the daemon is NOT alive (safe to proceed); return a
     friendly error string if alive (caller prints to stderr + returns 1).
 
-    Defense in depth: read `~/.iai-mcp/.daemon-state.json`, extract
-    `daemon_pid`. If absent, daemon is not alive → None. If present, check
-    `os.kill(pid, 0)` (does NOT signal — only checks process existence).
-    If alive, confirm `psutil.Process(pid).cmdline()` contains
-    `iai_mcp.daemon` to rule out PID-recycle false positives.
+    Read `~/.iai-mcp/.daemon-state.json`, extract `daemon_pid`. If absent,
+    daemon is not alive → None. If present, check `os.kill(pid, 0)` (does
+    NOT signal — only checks process existence). If alive, confirm
+    `psutil.Process(pid).cmdline()` contains `iai_mcp.daemon` to rule out
+    PID-recycle false positives.
     """
     import json as _json
     import os as _os
@@ -2004,7 +2153,7 @@ def _maintenance_compact_metrics(
 def _maintenance_compact_dry_run(
     store_path: Path, records_lance_dir: Path,
 ) -> int:
-    """--dry-run: open the store, capture pre-metrics, print JSON; do NOT
+    """Dry-run: open the store, capture pre-metrics, print JSON; do NOT
     call optimize, do NOT write an audit file.
     """
     import json as _json
@@ -2037,7 +2186,7 @@ def _maintenance_compact_dry_run(
 def _maintenance_compact_apply(
     store_path: Path, records_lance_dir: Path,
 ) -> int:
-    """--apply: open store, capture pre-metrics, call optimize(retention=0d)
+    """Apply: open store, capture pre-metrics, call optimize(retention=0d)
     on records/edges/events via the existing helper, capture post-metrics,
     assert record-id set equality on the records table, write audit file.
     """
@@ -2064,16 +2213,15 @@ def _maintenance_compact_apply(
     )
     elapsed = round(_time.monotonic() - t0, 3)
 
-    # Post: re-open store for fresh metadata view (helper docstring D7.3-09
-    # mentions some LanceDB versions cache table metadata on the original
-    # handle until refresh).
+    # Post: re-open store for fresh metadata view (some LanceDB versions
+    # cache table metadata on the original handle until refresh).
     store_after = MemoryStore(path=store_path)
     post_metrics = _maintenance_compact_metrics(
         records_lance_dir, store=store_after,
     )
     post_id_set = post_metrics["record_id_set"]
 
-    # Verbatim-recall invariant — record-id set equality (D-05 #2).
+    # Verbatim-recall invariant — record-id set must be unchanged post-optimize.
     if pre_id_set != post_id_set:
         missing = pre_id_set - post_id_set
         extra = post_id_set - pre_id_set
@@ -2148,7 +2296,7 @@ def _maintenance_compact_apply(
 
 
 def cmd_maintenance_compact_records(args: argparse.Namespace) -> int:
-    """Plan 07.14-01 one-shot LanceDB compaction CLI.
+    """One-shot LanceDB compaction CLI.
 
     Pre-flight: refuse if the daemon process is alive (PID + cmdline check).
     Mode: `--dry-run` (default) prints metrics-only JSON; `--apply --yes`
@@ -2159,11 +2307,10 @@ def cmd_maintenance_compact_records(args: argparse.Namespace) -> int:
     Exit codes: 0 ok, 1 pre-flight refusal or invariant abort, 2 wrong-flag
     combo (apply without yes on a non-tty).
 
-    This CLI runs with the daemon stopped, so `_should_yield_to_mcp` is
-    irrelevant. Per #4 the optimize call never paraphrases or smooths
-    stored content — it is pure storage compaction.
+    Runs with the daemon stopped. The optimize call never paraphrases or
+    smooths stored content — it is pure storage compaction.
     """
-    # Resolve store path (same convention as cmd_schema_cleanup line 1708).
+    # Resolve store path (same convention as cmd_schema_cleanup).
     if args.store_path is not None:
         store_path = Path(args.store_path).expanduser()
     else:
@@ -2200,7 +2347,7 @@ def cmd_maintenance_compact_records(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Pre-flight 3: interactive consent (mirrors cmd_daemon_install D-21).
+    # Pre-flight 3: interactive consent.
     if not yes:
         prompt = (
             "About to compact records.lance via optimize(cleanup_older_than="
@@ -2218,7 +2365,7 @@ def cmd_maintenance_compact_records(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# -- iai-mcp lifecycle status
+# iai-mcp lifecycle status
 # ---------------------------------------------------------------------------
 
 def _format_relative(ts_iso: str, now: datetime | None = None) -> str:
@@ -2252,18 +2399,18 @@ def _format_relative(ts_iso: str, now: datetime | None = None) -> str:
 
 
 def cmd_lifecycle_force_unlock(args: argparse.Namespace) -> int:
-    """Phase 10.6 Plan 10.6-01 Task 1.2: clear ``~/.iai-mcp/.locked``.
+    """Clear ``~/.iai-mcp/.locked``.
 
     Operator-facing recovery path for a stale lockfile that the
     daemon's own dead-PID takeover did not clear (e.g. cross-host
-    iCloud/NFS sync where the user wants to wipe the foreign
-    hostname BEFORE booting a new daemon, or a corrupt schema
-    bump that the operator wants to inspect).
+    iCloud/NFS sync where the user wants to wipe the foreign hostname
+    BEFORE booting a new daemon, or a corrupt schema bump that the
+    operator wants to inspect).
 
-    Output: prints the prior payload (PID + hostname + started_at)
-    so the operator can confirm what was cleared. ``--yes`` skips
-    the interactive [y/N] prompt; tests pass ``--yes`` to avoid
-    blocking on input().
+    Output: prints the prior payload (PID + hostname + started_at) so
+    the operator can confirm what was cleared. ``--yes`` skips the
+    interactive [y/N] prompt; tests pass ``--yes`` to avoid blocking on
+    input().
 
     Exit codes:
       0 -- file cleared (or absent already, which is also "clear")
@@ -2314,12 +2461,11 @@ def cmd_lifecycle_force_unlock(args: argparse.Namespace) -> int:
 
 
 def cmd_lifecycle_status(args: argparse.Namespace) -> int:
-    """print formatted snapshot of `lifecycle_state.json`.
+    """Print formatted snapshot of `lifecycle_state.json`.
 
-    Returns 0 unless the
-    state file is unreadable in a way that bypasses the self-heal
-    path (rare; load_state recovers from missing/corrupt files by
-    returning a fresh default WAKE record).
+    Returns 0 unless the state file is unreadable in a way that bypasses
+    the self-heal path (rare; load_state recovers from missing/corrupt
+    files by returning a fresh default WAKE record).
     """
     from iai_mcp.lifecycle_state import LIFECYCLE_STATE_PATH, load_state
 
@@ -2356,10 +2502,7 @@ def cmd_lifecycle_status(args: argparse.Namespace) -> int:
 
     shadow = record.get("shadow_run", True)
     if shadow:
-        print(
-            "shadow_run: true (legacy RSS-watchdog still owns shutdown "
-            "-- until Phase 10.6)"
-        )
+        print("shadow_run: true")
     else:
         print("shadow_run: false")
 
@@ -2367,22 +2510,21 @@ def cmd_lifecycle_status(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Plan 10.3-01 Task 1.5 -- iai-mcp maintenance sleep-cycle
+# iai-mcp maintenance sleep-cycle
 # ---------------------------------------------------------------------------
 #
 # CLI surface for the SleepPipeline. Two flags:
 #   --force              Run even when quarantined (operator override).
 #   --reset-quarantine   Clear quarantine first; then run normally.
 #
-# Output format: one line per
-# step in `[N/5] step_name ... ok (Ms)` format, plus a final summary
-# line. On quarantine without --force, exits non-zero with an
-# informational message pointing at --force / --reset-quarantine.
+# Output format: one line per step in `[N/5] step_name ... ok (Ms)` format,
+# plus a final summary line. On quarantine without --force, exits non-zero
+# with an informational message pointing at --force / --reset-quarantine.
 # ---------------------------------------------------------------------------
 
 
 def cmd_maintenance_sleep_cycle(args: argparse.Namespace) -> int:
-    """Plan 10.3-01 Task 1.5: run the sleep pipeline once.
+    """Run the sleep pipeline once.
 
     Exit codes:
       0 — success (5/5 steps complete) OR auto-recovery succeeded
@@ -2399,10 +2541,11 @@ def cmd_maintenance_sleep_cycle(args: argparse.Namespace) -> int:
     pipeline calls Lance optimize on a 1-day retention window (NOT
     retention=0d for steps 1-4), so coexistence with the daemon's own
     `optimize_lance_storage` periodic call is safe (LanceDB MVCC).
-    Step 5 (compact_records) does use retention=0d but the pipeline
-    runs CLI-only in — daemon coexistence is the Phase
-    10.4/10.5 wiring concern.
+    Step 5 (compact_records) uses retention=0d and is intended for
+    CLI-only invocation.
     """
+    from datetime import timezone as _tz
+
     from iai_mcp.lifecycle_event_log import LifecycleEventLog
     from iai_mcp.lifecycle_state import LIFECYCLE_STATE_PATH
     from iai_mcp.sleep_pipeline import SleepPipeline, SleepStep
@@ -2530,17 +2673,16 @@ def _build_parser() -> argparse.ArgumentParser:
     m = sub.add_parser(
         "migrate",
         help=(
-            "migrate records: 1->2 or 2->3 (Plan 02-08 encryption); "
-            "OR --resume / --rollback a partial reembed migration (Plan 07.11-03)"
+            "migrate records: 1->2 (schema) or 2->3 (encryption) or 3->4 (TEM); "
+            "OR --resume / --rollback a partial reembed migration"
         ),
     )
     m.add_argument("--from", dest="from_", type=int, default=1)
     m.add_argument("--to", type=int, default=2)
     m.add_argument("--dry-run", action="store_true")
     m.add_argument("--verbose", "-v", action="store_true")
-    # Plan 07.11-03 / crash-safe-reembed entry points. Additive flags;
-    # --from/--to dispatch is unchanged when neither --resume nor --rollback
-    # is passed.
+    # Crash-safe-reembed entry points. Additive flags; --from/--to dispatch
+    # is unchanged when neither --resume nor --rollback is passed.
     m.add_argument(
         "--resume",
         action="store_true",
@@ -2556,18 +2698,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     m.set_defaults(func=cmd_migrate)
 
-    # crypto subcommand.
+    # Crypto subcommand.
     c = sub.add_parser(
         "crypto",
-        help="encryption key management (Plan 02-08, SEC-ENCRYPTION-AT-REST)",
+        help="encryption key management (AES-256-GCM)",
     )
     crypto_sub = c.add_subparsers(dest="crypto_cmd", required=True)
 
     cs = crypto_sub.add_parser(
         "status",
         help=(
-            "(Plan 07.10) show file-backend key status: backend, path, "
-            "mode, uid, length validation, passphrase-fallback flag"
+            "show file-backend key status: backend, path, mode, uid, "
+            "length validation, passphrase-fallback flag"
         ),
     )
     cs.add_argument("--user-id", dest="user_id", default="default")
@@ -2579,12 +2721,12 @@ def _build_parser() -> argparse.ArgumentParser:
     cr.add_argument("--user-id", dest="user_id", default="default")
     cr.set_defaults(func=cmd_crypto_rotate)
 
-    # W3: migrate-to-file + init subcommands.
+    # Migrate-to-file + init subcommands.
     mtf = crypto_sub.add_parser(
         "migrate-to-file",
         help=(
-            "(Plan 07.10) one-time: read existing key from macOS Keychain "
-            "and write to .crypto.key file (interactive Terminal only)"
+            "one-time: read existing key from macOS Keychain and write to "
+            ".crypto.key file (interactive Terminal only)"
         ),
     )
     mtf.add_argument("--user-id", dest="user_id", default="default")
@@ -2607,7 +2749,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ci = crypto_sub.add_parser(
         "init",
         help=(
-            "(Plan 07.10) generate a fresh .crypto.key file "
+            "generate a fresh .crypto.key file "
             "(fresh installs only — refuses if file exists)"
         ),
     )
@@ -2647,7 +2789,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     t = sub.add_parser(
         "trajectory",
-        help="aggregate M1..M6 trajectory events (D-32, OPS-08)",
+        help="aggregate M1..M6 trajectory events",
     )
     t.add_argument(
         "--since",
@@ -2657,18 +2799,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     t.set_defaults(func=cmd_trajectory)
 
-    # CONN-07: live topology snapshot (sigma + C + L + community + rich-club).
+    # Live topology snapshot.
     topo = sub.add_parser(
         "topology",
         help=(
-            "live small-world topology snapshot (Plan 03-02 CONN-07): "
+            "live small-world topology snapshot: "
             "C, L, sigma, communities, rich-club ratio, N, regime"
         ),
     )
     topo.set_defaults(func=cmd_topology)
 
-    # Plan 06 WRITE-side ambient: capture a Claude Code JSONL transcript
-    # into the store (called by ~/.claude/hooks/iai-mcp-session-capture.sh).
+    # Capture a Claude Code JSONL transcript into the store
+    # (called by ~/.claude/hooks/iai-mcp-session-capture.sh).
     cap = sub.add_parser(
         "capture-transcript",
         help=(
@@ -2685,42 +2827,65 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "Hook-only mode: try connect with 250ms timeout. On miss, write "
-            "transcript to ~/.iai-mcp/.deferred-captures/ and exit 0 within 2s. "
-            "NEVER spawn daemon. Used by ~/.claude/hooks/iai-mcp-session-capture.sh "
-            "to eliminate spawn vector (Phase 7.1 R3 / D7.1-04)."
+            "Hook-only mode: write transcript to "
+            "~/.iai-mcp/.deferred-captures/ and exit 0 within 2s. "
+            "NEVER spawn the daemon. Used by "
+            "~/.claude/hooks/iai-mcp-session-capture.sh."
         ),
     )
     cap.set_defaults(func=cmd_capture_transcript)
 
-    # Plan 06 ambient-capture installer: drops the Stop hook into Claude Code
-    # or Codex hook config. Makes a fresh
+    ctd = sub.add_parser(
+        "capture-turn-deferred",
+        help=(
+            "append a single JSONL event per new transcript turn to "
+            "{session_id}.live.jsonl. UserPromptSubmit-hook backend."
+        ),
+    )
+    ctd.add_argument("--session-id", required=True)
+    ctd.add_argument("--transcript-path", required=True)
+    ctd.add_argument(
+        "--max-turns-per-call",
+        type=int,
+        default=200,
+        help="max new turns to process per invocation (default 200)",
+    )
+    ctd.set_defaults(func=cmd_capture_turn_deferred)
+
+    ssp = sub.add_parser(
+        "session-start",
+        help=(
+            "print the session-start recall payload as markdown on stdout. "
+            "Hook target for ~/.claude/hooks/iai-mcp-session-recall.sh."
+        ),
+    )
+    ssp.add_argument("--session-id", default="-", help="session id for provenance")
+    ssp.set_defaults(func=cmd_session_start)
+
+    # Ambient-capture installer: drops the Stop hook into
+    # ~/.claude/hooks/ and patches ~/.claude/settings.json. Makes a fresh
     # install of iai-mcp on another machine a two-step flow:
     #   pip install -e ".[dev,compress]"
     #   iai-mcp capture-hooks install
     ch = sub.add_parser(
         "capture-hooks",
-        help="install/uninstall/status Stop hooks for ambient session capture",
+        help="install/uninstall/status the Claude Code Stop hook for ambient session capture",
     )
     ch_sub = ch.add_subparsers(dest="capture_hooks_cmd", required=True)
-    for name, helptext, func in (
-        ("install", "copy and register the Stop hook", cmd_capture_hooks_install),
-        ("uninstall", "remove the Stop hook and config entry", cmd_capture_hooks_uninstall),
-        ("status", "show whether the Stop hook is installed and active", cmd_capture_hooks_status),
-    ):
-        hook_cmd = ch_sub.add_parser(name, help=helptext)
-        hook_cmd.add_argument(
-            "--target",
-            choices=["claude", "codex", "all"],
-            default="claude",
-            help="hook target to manage (default: claude)",
-        )
-        hook_cmd.set_defaults(func=func)
+    ch_sub.add_parser("install",
+                      help="copy Stop hook to ~/.claude/hooks/ and register in settings.json"
+                      ).set_defaults(func=cmd_capture_hooks_install)
+    ch_sub.add_parser("uninstall",
+                      help="remove the Stop hook and its settings.json entry"
+                      ).set_defaults(func=cmd_capture_hooks_uninstall)
+    ch_sub.add_parser("status",
+                      help="show whether the Stop hook is installed and active"
+                      ).set_defaults(func=cmd_capture_hooks_status)
 
-    # audit subcommand + sub-subcommands.
+    # Audit subcommand.
     a = sub.add_parser(
         "audit",
-        help="identity + shield audit log (OPS-07, D-30)",
+        help="identity + shield audit log",
     )
     a.add_argument(
         "--since",
@@ -2749,7 +2914,7 @@ def _build_parser() -> argparse.ArgumentParser:
         )
     a.set_defaults(func=cmd_audit)
 
-    # daemon subcommand group (DAEMON-10 + DAEMON-12).
+    # Daemon subcommand group.
     d = sub.add_parser(
         "daemon",
         help="sleep daemon: install/uninstall/start/stop/status/logs/...",
@@ -2760,7 +2925,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "install",
         help=(
             "install launchd plist (macOS) / systemd user unit (Linux); "
-            "first-run consent banner per unless --yes"
+            "first-run consent banner unless --yes"
         ),
     )
     di.add_argument(
@@ -2771,13 +2936,13 @@ def _build_parser() -> argparse.ArgumentParser:
     di.add_argument(
         "--yes", "-y",
         action="store_true",
-        help="skip the consent banner (records --yes audit-trail still)",
+        help="skip the first-run consent banner (audit trail still written)",
     )
     di.set_defaults(func=cmd_daemon_install)
 
     du = daemon_sub.add_parser(
         "uninstall",
-        help="C4 clean uninstall: remove plist/unit + 3 state files",
+        help="clean uninstall: remove plist/unit + state files",
     )
     du.add_argument("--yes", "-y", action="store_true")
     du.set_defaults(func=cmd_daemon_uninstall)
@@ -2808,7 +2973,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     daemon_sub.add_parser(
         "force-rem",
-        help="D-18 cooperative force: trigger one REM cycle out-of-schedule",
+        help="cooperative force: trigger one REM cycle out-of-schedule",
     ).set_defaults(func=cmd_daemon_force_rem)
 
     dpause = daemon_sub.add_parser(
@@ -2824,7 +2989,7 @@ def _build_parser() -> argparse.ArgumentParser:
     dconf = daemon_sub.add_parser(
         "configure",
         help=(
-            "D-22 per-setting override: set-budget / set-cycle-count / "
+            "per-setting override: set-budget / set-cycle-count / "
             "set-quiet-window / disable-claude / enable-claude"
         ),
     )
@@ -2841,15 +3006,15 @@ def _build_parser() -> argparse.ArgumentParser:
     dconf.add_argument("value", nargs="?", default=None)
     dconf.set_defaults(func=cmd_daemon_configure)
 
-    # R8: schema-cleanup top-level subcommand. NOT under
-    # `iai-mcp migrate ...` — `migrate` namespace is reserved for v-bump
-    # schema migrations (v3 -> v4 etc); this is a maintenance op.
+    # Schema-cleanup top-level subcommand. NOT under `iai-mcp migrate ...` —
+    # `migrate` namespace is reserved for v-bump schema migrations; this is
+    # a maintenance op.
     sc = sub.add_parser(
         "schema-cleanup",
         help=(
-            "soft-delete duplicate schema records (Plan 06-05 R8). Default "
-            "mode is --dry-run; --apply snapshots the LanceDB dir and "
-            "performs the cleanup. Idempotent (re-running is a no-op)."
+            "soft-delete duplicate schema records. Default mode is "
+            "--dry-run; --apply snapshots the LanceDB dir and performs "
+            "the cleanup. Idempotent (re-running is a no-op)."
         ),
     )
     sc_mode = sc.add_mutually_exclusive_group()
@@ -2876,14 +3041,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sc.set_defaults(func=cmd_schema_cleanup)
 
-    # Plan 07.14-01 top-level `maintenance` subcommand for one-shot
-    # Lance compaction. Same placement precedent as `schema-cleanup` and
-    # `doctor` — top-level discoverability matters for first-touch ops.
+    # Top-level `maintenance` subcommand for one-shot Lance compaction.
+    # Same placement precedent as `schema-cleanup` and `doctor`.
     mtn = sub.add_parser(
         "maintenance",
         help=(
-            "one-shot maintenance ops (Plan 07.14-01). Currently: "
-            "compact-records (drain LanceDB version-manifest pile)."
+            "one-shot maintenance ops. Currently: compact-records "
+            "(drain LanceDB version-manifest pile) and sleep-cycle."
         ),
     )
     mtn_sub = mtn.add_subparsers(dest="maintenance_cmd", required=True)
@@ -2925,14 +3089,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     mtn_compact.set_defaults(func=cmd_maintenance_compact_records)
 
-    # Plan 10.3-01 Task 1.5: maintenance sleep-cycle subcommand.
+    # Maintenance sleep-cycle subcommand.
     # Runs the 5-step SleepPipeline (schema_mine -> knob_tune ->
     # dream_decay -> optimize_lance -> compact_records) once, with
     # quarantine gating + bounded-deferral support.
     mtn_sleep = mtn_sub.add_parser(
         "sleep-cycle",
         help=(
-            "(Phase 10.3) run the 5-step sleep pipeline once: "
+            "run the 5-step sleep pipeline once: "
             "schema_mine, knob_tune, dream_decay, optimize_lance, "
             "compact_records. 3-strike auto-quarantine; use --force "
             "to override, --reset-quarantine to clear."
@@ -2962,23 +3126,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     mtn_sleep.set_defaults(func=cmd_maintenance_sleep_cycle)
 
-    # R9: doctor top-level subcommand (D7-10 — same placement
-    # precedent as `iai-mcp schema-cleanup`, NOT nested under
-    # `iai-mcp daemon`). First-touch recovery tool — top-level
-    # discoverability matters when the user sees `daemon_unreachable`.
+    # Doctor top-level subcommand. Same placement precedent as
+    # `iai-mcp schema-cleanup`, NOT nested under `iai-mcp daemon`.
+    # First-touch recovery tool — top-level discoverability matters
+    # when the user sees `daemon_unreachable`.
     doc = sub.add_parser(
         "doctor",
         help=(
-            "Diagnose daemon health (7 checks; (g) duplicate-binder detection "
-            "added in R6). With --apply, attempt safe repairs "
-            "(unlink stale socket, kill duplicate binders, cleanup orphans, "
-            "respawn daemon). With --apply --yes, skip confirmations. "
+            "Diagnose daemon health (7 checks including duplicate-binder "
+            "detection). With --apply, attempt safe repairs (unlink stale "
+            "socket, kill duplicate binders, cleanup orphans, respawn daemon). "
+            "With --apply --yes, skip confirmations. "
             "Exit 0=all green, 1=any FAIL, 2=--apply tried but FAIL persists."
         ),
     )
     # --apply is additive (NOT a mode switch like dry-run/apply on
     # schema-cleanup), so no mutually-exclusive group; --yes is a sub-modifier
-    # that cmd_doctor checks for warning-and-ignore semantics if used alone.
+    # that cmd_doctor checks for its warning semantics if used alone.
     doc.add_argument(
         "--apply",
         action="store_true",
@@ -2993,13 +3157,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     doc.set_defaults(func=cmd_doctor)
 
-    # -- iai-mcp lifecycle status. Top-level placement
-    # follows the `doctor` / `maintenance` precedent: first-touch
-    # observability matters and the user types it directly.
+    # iai-mcp lifecycle status. Top-level placement follows the
+    # `doctor` / `maintenance` precedent.
     lc = sub.add_parser(
         "lifecycle",
         help=(
-            "(Plan 10.1) inspect lifecycle state machine "
+            "inspect lifecycle state machine "
             "(WAKE/DROWSY/SLEEP/HIBERNATION). Currently: status."
         ),
     )
@@ -3014,13 +3177,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     lc_status.set_defaults(func=cmd_lifecycle_status)
 
-    # Plan 10.6-01 Task 1.2: force-unlock recovery for
-    # ~/.iai-mcp/.locked. Operator path; daemon-side dead-PID takeover
-    # handles the common case automatically.
+    # Force-unlock recovery for ~/.iai-mcp/.locked. Operator path;
+    # daemon-side dead-PID takeover handles the common case automatically.
     lc_unlock = lc_sub.add_parser(
         "force-unlock",
         help=(
-            "(Plan 10.6) clear a stale ~/.iai-mcp/.locked lockfile and "
+            "clear a stale ~/.iai-mcp/.locked lockfile and "
             "print the prior PID / hostname / started_at"
         ),
     )

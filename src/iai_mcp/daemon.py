@@ -1,27 +1,27 @@
-"""IAI-MCP Sleep Daemon main entry point (DAEMON-01 / DAEMON-02).
+"""IAI-MCP Sleep Daemon main entry point.
 
-Constitutional guard:
+
+Constitutional guards:
 - C1 HUMAN-FIRST: daemon NEVER starts heavy ops while ANY MCP active. _tick_body
-  calls `lock.try_acquire_exclusive()` and yields immediately on False. Between
+  calls `lock.try_acquire_exclusive` and yields immediately on False. Between
   REM cycles, `_check_still_exclusive(lock)` probes `holds_exclusive_nb` and
   the cycle loop breaks if MCP acquired a shared lock mid-night.
-- C-USER-CONSENT (formerly C2 per D7-16): daemon NEVER initiates sleep
-  mode without explicit user consent; consent gate lives in Plan 04-03
-  (bedtime.py). Renamed to disambiguate from Phase 7's structural
-  C-DISPATCHER-FSM-ISOLATION invariant declared in socket_server.py.
+- C-USER-CONSENT: daemon NEVER initiates sleep mode without explicit user
+  consent; consent gate lives in bedtime.py.
 - C3: ZERO API cost. This module does NOT reference the paid-API env var;
-  wires host_cli.py with env scrubbed at subprocess creation.
+  claude_cli.py is wired with env scrubbed at subprocess creation.
 - C4: Clean uninstall via signal.SIGTERM -> shutdown event -> task cancel +
-  lock.close() + state persisted. launchd/systemd stop this daemon cleanly.
-- C5: literal preservation -- daemon never assigns to record.literal_surface.
-  Called modules (sleep.py / schema.py) respect by design (Phase 1
-  constitutional). Grep-guarded by tests/test_constitutional_guards.py.
+  lock.close + state persisted. launchd/systemd stop this daemon cleanly.
+- C5: Literal preservation -- daemon never assigns to record.literal_surface.
+  Called modules (sleep.py / schema.py) respect this by design.
+  Grep-guarded by tests/test_constitutional_guards.py.
 - C6: S5 audit runs read-only (MVCC); spawned as an independent task alongside
   the scheduler so it continues even when the scheduler is blocked on a heavy op.
 
+
 The scheduler tick loop only emits `tick_error` events on exception; it never
-crashes. fleshes out _tick_body: empty-store shortcut, quiet-window
-re-learn, bootstrap fallback, lock acquire with C1 yield, N-cycle REM loop via
+crashes. _tick_body implements: empty-store shortcut, quiet-window re-learn,
+bootstrap fallback, lock acquire with C1 yield, N-cycle REM loop via
 `dream.run_rem_cycle`, FSM transitions, pending_digest accumulation.
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from iai_mcp import s4
-from iai_mcp.concurrency import ProcessLock, serve_control_socket  # noqa: F401 -- kept for D7-17 / transition compat (concurrency.serve_control_socket function STAYS in concurrency.py for the 1226-test suite; only its invocation in daemon.main() is removed in Wave 3)
+from iai_mcp.concurrency import ProcessLock, serve_control_socket  # noqa: F401 -- kept for backward compat (serve_control_socket STAYS in concurrency.py for the test suite)
 from iai_mcp.daemon_state import load_state, save_state
 from iai_mcp.dream import run_rem_cycle
 from iai_mcp.events import write_event
@@ -83,11 +83,11 @@ DEFAULT_CYCLE_COUNT: int = 4
 # coherent "hourly heartbeat" of diagnostics.
 S4_OFFLINE_INTERVAL_SEC: int = 60 * 60
 
-# W1 / startup grace period before the FIRST iteration of
+# .6 W1: startup grace period before the FIRST iteration of
 # `_s4_offline_loop`. The S4 offline pass walks the full graph and on cold
 # caches calls `runtime_graph_cache.save -> json.dumps`, materialising a
-# multi-GB intermediate string (py-spy confirmed RSS 7.6GB on cold start).
-# Default = S4_OFFLINE_INTERVAL_SEC (1h, matching steady-state
+# multi-GB intermediate string (: py-spy 2026-04-29 PID 7959
+# RSS 7.6GB). Default = S4_OFFLINE_INTERVAL_SEC (1h, matching steady-state
 # cadence). Set to 0 for tests / explicit warm-start. Env override
 # IAI_MCP_S4_FIRST_ITER_GRACE_SEC.
 S4_FIRST_ITER_GRACE_SEC: float = float(
@@ -96,11 +96,58 @@ S4_FIRST_ITER_GRACE_SEC: float = float(
 
 
 # ---------------------------------------------------------------------------
+# WAKE -> DROWSY drain edge helpers
+# ---------------------------------------------------------------------------
+
+
+def _should_drain_on_drowsy_edge(prev, current) -> bool:
+    """True iff this is the edge into DROWSY (prev=WAKE, current=DROWSY)."""
+    from iai_mcp.lifecycle_state import LifecycleState as _L
+    return prev is _L.WAKE and current is _L.DROWSY
+
+
+def _run_drowsy_drain(store, *, drain_fn, write_event_fn) -> None:
+    """Run drain and emit one bookkeeping event.
+
+
+    Writes ``deferred_drain_drowsy`` only when work was done; on exception
+    swallows and writes ``deferred_drain_failed`` with ``phase='drowsy'``.
+    Silent on zero-work to avoid log noise.
+    """
+    try:
+        result = drain_fn(store)
+    except Exception as e:  # noqa: BLE001 -- lifecycle_tick MUST NOT crash
+        try:
+            write_event_fn(
+                store,
+                "deferred_drain_failed",
+                {"error": str(e)[:200], "phase": "drowsy"},
+                severity="warning",
+            )
+        except Exception:
+            pass
+        return
+    if not isinstance(result, dict):
+        return
+    if result.get("files_drained") or result.get("files_failed"):
+        try:
+            write_event_fn(
+                store,
+                "deferred_drain_drowsy",
+                result,
+                severity="info",
+            )
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # State machine transitions (separated so tests can exercise directly)
 # ---------------------------------------------------------------------------
 
 def transition(state: dict, new_fsm: str) -> None:
     """Attempt the WAKE/TRANSITIONING/SLEEP/DREAMING edge.
+
 
     Raises ValueError when the edge is not in VALID_TRANSITIONS. Persists
     the new fsm_state + fsm_transition_at via save_state.
@@ -155,11 +202,13 @@ def _is_inside_window(
 def _check_still_exclusive(lock: ProcessLock) -> bool:
     """Verify the daemon still holds the exclusive lock between REM cycles.
 
-    HUMAN-FIRST: if an MCP client acquired a shared lock mid-night
+
+     HUMAN-FIRST: if an MCP client acquired a shared lock mid-night
     (e.g. user opened Claude Code between our REM cycles), the daemon
     must yield cooperatively BEFORE starting the next cycle.
 
-    Delegates to `ProcessLock.holds_exclusive_nb`. That
+
+    Delegates to `ProcessLock.holds_exclusive_nb` (Task 1). That
     method re-tries `fcntl.flock(LOCK_EX | LOCK_NB)` on our existing fd:
     - Still holding exclusive: re-acquire is a no-op success -> True.
     - MCP grabbed shared in between: EWOULDBLOCK -> False -> daemon yields.
@@ -168,8 +217,8 @@ def _check_still_exclusive(lock: ProcessLock) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Plan 10.6-01 Task 1.4: removed `_should_yield_to_mcp` /
-# `MCP_RECENT_ACTIVITY_WINDOW_SEC`. The D7-09 in-process C1 yield
+# removed `_should_yield_to_mcp` /
+# `MCP_RECENT_ACTIVITY_WINDOW_SEC`. The in-process C1 yield
 # helper deferred REM cycles when MCP traffic was active or recent. Phase
 # 10.6 supersedes this gate with the lifecycle state machine: when wrapper
 # heartbeats are FRESH the daemon is in WAKE state and the sleep_pipeline
@@ -182,7 +231,7 @@ def _check_still_exclusive(lock: ProcessLock) -> bool:
 
 
 def _update_pending_digest(state: dict, cycle_result: dict) -> None:
-    """Accumulate per-cycle outputs into the morning digest (D-23, Plan 04-04)."""
+    """Accumulate per-cycle outputs into the morning digest (, )."""
     digest = state.get("pending_digest") or {
         "rem_cycles_completed": 0,
         "episodes_processed": 0,
@@ -219,43 +268,48 @@ async def _tick_body(
 ) -> None:
     """One scheduler tick. Runs every TICK_INTERVAL_SEC (30s).
 
+
     Decision tree:
-    0.5 R3 / D7.2-09 (b): drain first_turn_pending entries older
+    0.5 (b): drain first_turn_pending entries older
         than 1 h. Runs FIRST so stale entries get cleared regardless of any
         yield/pause downstream. Helper called with explicit `now=` kwarg so
+
         its behaviour is fully driven by this tick's clock. Emits
-        `first_turn_pending_expired` event when entries are dropped (D7.2-10).
-    -1. REMOVED (was D7-09 in-process C1 yield via
+        `first_turn_pending_expired` event when entries are dropped .
+    -1. REMOVED (was in-process C1 yield via
         `_should_yield_to_mcp(mcp_socket)`). Lifecycle state machine
         supersedes this gate: REM cycles only run inside the learned
         quiet window where MCP traffic is rare. ProcessLock + Lance
         MVCC remain the secondary guards. The `mcp_socket` kwarg is
         retained as accepted-and-ignored so existing tests keep working.
-    0. scheduler_paused -> skip immediately (Plan 04-gap-1).
+    0. scheduler_paused -> skip immediately (gap-fill).
     1. Empty store -> short-circuit (Pitfall 4).
-    2. Re-learn quiet window if 24h elapsed.
+    2. Re-learn quiet window if 24h elapsed .
     3. Determine if we are inside the learned window OR the 2h-idle bootstrap
-       OR a user_sleep_request / force_rem_request is pending (Plan 04-gap-1).
+       OR a user_sleep_request / force_rem_request is pending (gap-fill).
        Otherwise return without lock acquire.
     4. C1 gate: try_acquire_exclusive. If False -> emit `daemon_yielded`
        with reason=mcp_active, return.
+
     5. Transition WAKE -> TRANSITIONING -> SLEEP.
     6. Loop up to DEFAULT_CYCLE_COUNT REM cycles via `run_rem_cycle`. Between
        cycles, probe `_check_still_exclusive` AND `force_wake_request`. On
        either: emit `daemon_yielded` and break.
     7. Transition SLEEP -> WAKE, release lock, persist state.
 
+
     Exceptions inside the REM loop surface as `rem_cycle_error` events
     emitted by dream.run_rem_cycle itself; this function's try/finally
     guarantees the lock is released even on an unexpected raise.
     """
-    # --- Step 0.5: R3 / D7.2-09 (b) per-tick prune ---------------
+    # --- Step 0.5: per-tick prune ---------------
     # Drain stale first_turn_pending entries (older than 1 h) on every tick.
     # Runs BEFORE any yield/pause/empty-store gate so stale entries clear
     # even when the rest of the tick would skip. Pure-in-memory walk +
     # at most one save_state + at most one event emit, all wrapped in
     # try/except so a malformed state never blocks the tick.
     #
+
     # Explicit `now=datetime.now(timezone.utc)` kwarg threads this tick's
     # clock into the helper; the helper does NOT call datetime.now itself
     # along this path, which keeps the function pure and trivially testable
@@ -290,20 +344,20 @@ async def _tick_body(
             except Exception:
                 pass
     except Exception:
-        # Defense-in-depth: drain MUST NOT crash the tick. Phase 7.1
-        # D7.1-04 established the discipline of swallowing exceptions in
+        # Defense-in-depth: drain MUST NOT crash the tick. .1
+        # established the discipline of swallowing exceptions in
         # auxiliary tick steps to preserve C1 cooperative scheduling.
         pass
 
-    # --- Step -1: REMOVED in ------------------------------------
-    # The D7-09 in-process C1 HUMAN-FIRST yield (was
+    # --- Step -1: REMOVED in .6 ------------------------------------
+    # The in-process C1 HUMAN-FIRST yield (was
     # `_should_yield_to_mcp(mcp_socket)`) is gone. The lifecycle state
     # machine + sleep_pipeline supersede it: REM cycles only run inside
     # the learned quiet window, where MCP traffic is rare; the daemon's
     # ProcessLock + Lance MVCC remain the secondary guards if traffic
     # arrives mid-cycle.
 
-    # --- Step 0: scheduler_paused gate (Plan 04-gap-1) ----------------------
+    # --- Step 0: scheduler_paused gate (gap-fill) ----------------------
     if state.get("scheduler_paused") is True:
         try:
             await asyncio.to_thread(
@@ -356,7 +410,7 @@ async def _tick_body(
         save_state(state)
 
     # --- Step 3: decide whether to run at all -------------------------------
-    # Plan 04-gap-1: user_sleep_request or force_rem_request bypass the
+    # gap-fill: user_sleep_request or force_rem_request bypass the
     # quiet-window + idle-bootstrap checks. They are explicit user / operator
     # overrides and must run immediately when the daemon can take the lock.
     user_sleep_req = state.get("user_sleep_request") or {}
@@ -417,7 +471,7 @@ async def _tick_body(
 
         session_id = f"daemon-{now.isoformat()}"
 
-        # Plan 04-gap-1: force_rem_request runs ONE out-of-schedule REM cycle.
+        # gap-fill: force_rem_request runs ONE out-of-schedule REM cycle.
         # Clear the flag first so a raise inside run_rem_cycle doesn't loop.
         if force_rem_pending:
             req = state.get("force_rem_request") or {}
@@ -460,7 +514,7 @@ async def _tick_body(
             transition(state, STATE_SLEEP)
             completed = i
 
-            # Plan 04-gap-1: force_wake_request between cycles.
+            # gap-fill: force_wake_request between cycles.
             force_wake_req = state.get("force_wake_request") or {}
             if force_wake_req.get("pending") is True:
                 try:
@@ -501,7 +555,7 @@ async def _tick_body(
 
         transition(state, STATE_WAKE)
 
-        # R3 / D7.1-04: drain deferred-captures on every WAKE
+        # drain deferred-captures on every WAKE
         # transition. While the daemon was in SLEEP/DREAMING, Stop hooks
         # may have written --no-spawn deferral files to
         # ~/.iai-mcp/.deferred-captures/ (the daemon's MCP socket is open
@@ -554,11 +608,14 @@ async def _scheduler_tick(
 ) -> None:
     """Run _tick_body every TICK_INTERVAL_SEC.
 
+
     An individual tick failure MUST NOT crash the daemon. We catch all
     exceptions, write a `tick_error` event (best-effort; even the event
+
     write is wrapped), and keep looping.
 
-    D7-09 LOCKED: when invoked from daemon.main(), mcp_socket is
+
+    LOCKED: when invoked from daemon.main, mcp_socket is
     threaded through to _tick_body so the in-process C1 HUMAN-FIRST yield
     can probe mcp_socket.last_activity_ts and active_connections between
     REM cycles. Legacy unit tests that pass a custom tick_body keep working
@@ -612,12 +669,14 @@ async def _scheduler_tick(
 async def _s4_offline_loop(store: MemoryStore, shutdown: asyncio.Event) -> None:
     """Hourly S4 viability scan -- contradictions, drift, stale goals, hit_rate.
 
+
     FSRS decay is applied by WALL-CLOCK elapsed time since last_reviewed (not
     per access count), so this loop only needs a wall-clock cadence; it does
     NOT iterate records or advance per-read counters. That keeps the loop
     cheap enough to run concurrent with other daemon work via LanceDB MVCC.
 
-    W1 / D-04, a startup grace period delays the FIRST
+
+    W1 / , : a startup grace period delays the FIRST
     iteration so a freshly-spawned daemon does not immediately run the heavy
     S4 viability scan before draining deferred captures. Configured via
     S4_FIRST_ITER_GRACE_SEC (env IAI_MCP_S4_FIRST_ITER_GRACE_SEC). Cancellation
@@ -657,7 +716,7 @@ async def _s4_offline_loop(store: MemoryStore, shutdown: asyncio.Event) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HIPPEA activation cascade loop (Plan 05-04 TOK-14 / D5-05)
+# HIPPEA activation cascade loop ( / D5-05)
 # ---------------------------------------------------------------------------
 
 # Poll cadence for the cascade loop. Short enough that a session_open event
@@ -665,14 +724,14 @@ async def _s4_offline_loop(store: MemoryStore, shutdown: asyncio.Event) -> None:
 # that an idle loop doesn't spin the CPU.
 HIPPEA_CASCADE_POLL_SEC: float = 5.0
 
-# R2 / D7.2-04: minimum interval between cascade body executions.
+# minimum interval between cascade body executions.
 # Default 60s = 12x the 5s poll cadence; gates heavy work without dropping
 # `pending` flags. Env override IAI_MCP_HIPPEA_MIN_INTERVAL_SEC.
 HIPPEA_CASCADE_MIN_INTERVAL_SEC: float = float(
     os.environ.get("IAI_MCP_HIPPEA_MIN_INTERVAL_SEC", "60.0"),
 )
 
-# R2 / D7.2-03: timestamp of the most recent cascade body
+# timestamp of the most recent cascade body
 # completion (success or exception). Module-level mutable; the cascade
 # loop declares `global _last_cascade_completed_at` to write. Ephemeral
 # by design — daemon restart resets to 0.0 (subsequent pending=true
@@ -683,13 +742,13 @@ _last_cascade_completed_at: float = 0.0
 
 
 # ---------------------------------------------------------------------------
-# R5 / D7.2-16..D7.2-21: CPU watchdog (observation-only)
+# : CPU watchdog (observation-only)
 # ---------------------------------------------------------------------------
 # Polls own-process CPU every WATCHDOG_POLL_SEC; emits `daemon_cpu_overload`
 # (severity=critical) on sustained > WATCHDOG_THRESHOLD_PERCENT for 2
 # consecutive samples (= WATCHDOG_POLL_SEC * 2 seconds sustained). The 71-
 # minute blind period from 2026-04-27 (99-363% CPU, zero events) cannot
-# recur. D7.2-21 LOCKED: observation-only — no SIGTERM, no os.kill, no
+# recur. LOCKED: observation-only — no SIGTERM, no os.kill, no
 # launchctl. Triage / repair is user-driven (Activity Monitor + launchctl
 # unload -w). Auto-kill risks data loss + breaks C1 HUMAN-FIRST.
 WATCHDOG_POLL_SEC: float = float(
@@ -703,34 +762,35 @@ WATCHDOG_EVENT_COOLDOWN_SEC: float = float(
 )
 WATCHDOG_SAMPLE_WINDOW: int = 4
 
-# R5 / D7.2-20: timestamp of the most recent overload event emit.
+# timestamp of the most recent overload event emit.
 # Module-level mutable; `_cpu_watchdog_loop` declares `global` to write.
 # Ephemeral — daemon restart resets to 0.0 so the first overload after
 # restart can fire without waiting out a stale cooldown.
 _last_overload_event_at: float = 0.0
 
-# R5: monotonic boot timestamp; populated in main() after the
+# .2 R5: monotonic boot timestamp; populated in main after the
 # daemon's wall-clock `daemon_started_at` stamp. Used by the watchdog to
 # include `uptime_sec` in the overload payload. None until first stamped.
 _daemon_started_monotonic: float | None = None
 
 
 # ---------------------------------------------------------------------------
-# Plan 10.6-01 Task 1.4: REMOVED RSS-watchdog
+# REMOVED .8 RSS-watchdog
 # restart-policy block (`_should_restart`, `_clean_shutdown_for_restart`,
 # `_rss_watchdog_loop`, env vars `IAI_MCP_RSS_RESTART_THRESHOLD_MB`,
 # `IAI_MCP_TTL_RESTART_HOURS`, `IAI_MCP_COLD_START_GRACE_SEC`). The
 # lifecycle state machine + sleep_pipeline supersede this loop:
 # Hibernation (process kill, RSS=0) is the new mechanism for unbounded
 # RSS / long-uptime collapse. The plist's `KeepAlive={"Crashed": true}`
-# (Phase 10.6 plist update) ensures graceful exit 0 stays dead until
+# (.6 plist update) ensures graceful exit 0 stays dead until
 # wrapper kickstart, so periodic restart is no longer a concern.
 # ---------------------------------------------------------------------------
 
 
 async def _hippea_cascade_loop(store, shutdown: asyncio.Event) -> None:
-    """Plan 05-04 D5-05: 5th daemon task. Polls `hippea_cascade_request` and
+    """5th daemon task. Polls `hippea_cascade_request` and
     pre-warms the HIPPEA LRU on pending.
+
 
     Constitutional invariants:
     - C1 HUMAN-FIRST: yields on shutdown within 5s (via asyncio.wait_for).
@@ -740,19 +800,21 @@ async def _hippea_cascade_loop(store, shutdown: asyncio.Event) -> None:
       a `hippea_cascade_completed` diagnostic event. Neither mutates
       MemoryRecord rows.
 
-    R1 / D7.2-01: `retrieve.build_runtime_graph(store)` is now
+
+    `retrieve.build_runtime_graph(store)` is now
     wrapped in `await asyncio.to_thread(...)` — previously the bare-sync
     call blocked the asyncio event loop for 8-13 s while it traversed
     NetworkX. Wrapping unblocks every other coroutine on the loop
     (socket_server.handle, _tick_body, _s4_offline_loop, audit_task).
 
-    R2 / D7.2-03..D7.2-06: cascade body is gated by a 60 s
+
+    : cascade body is gated by a 60 s
     minimum-interval cooldown (`HIPPEA_CASCADE_MIN_INTERVAL_SEC`). When
     cooldown blocks, `pending=true` STAYS set (the cooldown gates work,
     does not consume requests). Next poll re-checks. Worst-case under
     perpetual `pending=true`: ≤ 1 cascade per 60 s.
     """
-    # R2 / Pitfall 3: explicit `global` so the assignment in the
+    # .2 R2 / Pitfall 3: explicit `global` so the assignment in the
     # finally block updates module-level state, not a local binding. Without
     # this declaration the cooldown is silently broken.
     global _last_cascade_completed_at
@@ -767,7 +829,7 @@ async def _hippea_cascade_loop(store, shutdown: asyncio.Event) -> None:
             state = load_state()
             req = state.get("hippea_cascade_request") or {}
             if req.get("pending"):
-                # R2 cooldown gate (D7.2-05). If cascade body ran
+                # .2 R2 cooldown gate . If cascade body ran
                 # within the last MIN_INTERVAL seconds, skip the body but
                 # leave `pending=true` so the next eligible poll runs it.
                 elapsed = time.monotonic() - _last_cascade_completed_at
@@ -780,7 +842,7 @@ async def _hippea_cascade_loop(store, shutdown: asyncio.Event) -> None:
                     try:
                         assignment = None
                         try:
-                            # R1 / D7.2-01: wrap heavy sync call.
+                            # wrap heavy sync call.
                             # Returns the 3-tuple (graph, assignment, rich_club)
                             # intact through to_thread.
                             _graph, assignment, _rc = await asyncio.to_thread(
@@ -793,7 +855,7 @@ async def _hippea_cascade_loop(store, shutdown: asyncio.Event) -> None:
                         }
                         if assignment is not None:
                             try:
-                                # run_cascade is async-clean (D7.2-02);
+                                # run_cascade is async-clean ;
                                 # direct await is correct.
                                 stats = await run_cascade(store, assignment)
                             except Exception:
@@ -826,7 +888,7 @@ async def _hippea_cascade_loop(store, shutdown: asyncio.Event) -> None:
                         except Exception:
                             pass
                     finally:
-                        # R2 / D7.2-05: stamp end-of-cascade
+                        # stamp end-of-cascade
                         # timestamp regardless of success/exception. Updates
                         # module-level state via the `global` declaration
                         # at the top of the function body.
@@ -846,15 +908,17 @@ async def _hippea_cascade_loop(store, shutdown: asyncio.Event) -> None:
 
 
 # ---------------------------------------------------------------------------
-# R5 / D7.2-16..D7.2-21: CPU watchdog body (observation-only)
+# : CPU watchdog body (observation-only)
 # ---------------------------------------------------------------------------
 
 def _watchdog_active_task_names() -> list[str]:
-    """D7.2 Claude's Discretion: best-effort `active_tasks` payload.
+    """Best-effort `active_tasks` payload.
+
 
     Returns up to 5 names of currently-running asyncio tasks (excluding
-    done tasks). Falls back to '?' on empty get_name(). Wrapped in
+    done tasks). Falls back to '?' on empty get_name. Wrapped in
     try/except so an introspection failure never blocks the event emit.
+
     """
     out: list[str] = []
     try:
@@ -869,23 +933,28 @@ def _watchdog_active_task_names() -> list[str]:
 
 
 async def _cpu_watchdog_loop(store, shutdown: asyncio.Event) -> None:
-    """Phase 7.2 R5 / D7.2-16..D7.2-21: observation-only CPU watchdog.
+    """: observation-only CPU watchdog.
+
 
     Polls own-process CPU every WATCHDOG_POLL_SEC seconds via
-    psutil.Process(os.getpid()).cpu_percent(interval=None). When the
+    psutil.Process(os.getpid).cpu_percent(interval=None). When the
     last 2 samples both exceed WATCHDOG_THRESHOLD_PERCENT (default 50),
     emits `daemon_cpu_overload` event with severity=critical containing
     fsm_state, cpu_samples_pct, uptime_sec, active_tasks, threshold_pct,
     sustained_sec.
 
+
     Per-event cooldown WATCHDOG_EVENT_COOLDOWN_SEC (default 300s) prevents
     ledger flood under prolonged overload — at most one event per 5 min.
 
-    D7.2-21: OBSERVATION-ONLY. No SIGTERM, no os.kill, no launchctl.
+
+    : OBSERVATION-ONLY. No SIGTERM, no os.kill, no launchctl.
     The only side-effect is a write_event call. Triage / repair is
     user-driven (Activity Monitor, launchctl unload -w). Auto-kill
-    risks data loss + breaks C1 HUMAN-FIRST. Phase 8+ may add a soft-
+    risks data loss + breaks C1 HUMAN-FIRST. may add a soft-
     yield signal; 7.2 stays pure-observation.
+
+
 
     Pitfall 1 mitigation: prime the meter ONCE before the polling loop
     so the first real sample at t=POLL_SEC is a meaningful delta, not
@@ -935,7 +1004,7 @@ async def _cpu_watchdog_loop(store, shutdown: asyncio.Event) -> None:
             and samples[-2] > WATCHDOG_THRESHOLD_PERCENT
         ):
             now_mono = time.monotonic()
-            # D7.2-20 cooldown: at most 1 event per 5 min.
+            # cooldown: at most 1 event per 5 min.
             if (now_mono - _last_overload_event_at) < WATCHDOG_EVENT_COOLDOWN_SEC:
                 continue
 
@@ -974,26 +1043,28 @@ async def _cpu_watchdog_loop(store, shutdown: asyncio.Event) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Plan 10.6-01 Task 1.4: REMOVED the RSS watchdog +
+# REMOVED the .8 RSS watchdog +
 # clean-shutdown restart trigger block. `_resolve_shutdown_exit_code`
 # (75/0 sentinel decision), `_clean_shutdown_for_restart` (os._exit(75)),
 # `_rss_watchdog_loop` (RSS polling + TTL trigger) are all gone.
 #
+
 # The lifecycle state machine + sleep_pipeline supersede this design.
 # Hibernation kills the process with exit 0 (graceful) and the plist's
 # `KeepAlive={"Crashed": true}` ensures launchd does NOT auto-respawn
 # on graceful exit; the wrapper kickstart is the wake mechanism.
 #
+
 # The user-stop sentinel from 541c874 is PRESERVED but simplified.
 # `iai-mcp daemon stop` still writes `user_requested_shutdown=True`
-# to `.daemon-state.json` before SIGTERM; the daemon's main() finally
+# to `.daemon-state.json` before SIGTERM; the daemon's main finally
 # block clears the sentinel from the on-disk file (so a stale flag
 # cannot leak across boots) but the exit code is now uniformly 0
 # regardless of who triggered the shutdown.
 # ---------------------------------------------------------------------------
 
 # Sentinel key in .daemon-state.json. Preserved from 541c874. Phase
-# 10.6 simplifies the read semantics: the daemon's main() finally
+# 10.6 simplifies the read semantics: the daemon's main finally
 # block clears the on-disk flag so it does not leak across boots; the
 # exit code no longer branches on it (always 0).
 _USER_SHUTDOWN_FLAG = "user_requested_shutdown"
@@ -1002,6 +1073,7 @@ _USER_SHUTDOWN_FLAG = "user_requested_shutdown"
 def _clear_user_shutdown_sentinel(state: dict) -> None:
     """Clear the on-disk + in-memory ``user_requested_shutdown`` flag.
 
+
     Cross-process invariant (preserved from 541c874): the CLI
     ``iai-mcp daemon stop`` runs in a SEPARATE process from the daemon
     and writes the sentinel to ``.daemon-state.json`` BEFORE sending
@@ -1009,14 +1081,16 @@ def _clear_user_shutdown_sentinel(state: dict) -> None:
     time and is never re-read on signal — so the disk-side flag must
     be cleared explicitly here, not just popped from the memory dict.
 
+
     change: the function ONLY clears the sentinel; it does
-    NOT decide an exit code. main() always returns 0 on graceful
+    NOT decide an exit code. main always returns 0 on graceful
     shutdown, regardless of who triggered it. launchd's
     ``KeepAlive={"Crashed": true}`` plist ensures graceful exit 0
     stays dead until wrapper kickstart fires.
 
+
     Read failure is fail-safe: ignored. The next ``save_state`` from
-    main() will overwrite the on-disk record anyway.
+    main will overwrite the on-disk record anyway.
     """
     try:
         on_disk = load_state()
@@ -1036,38 +1110,42 @@ def _clear_user_shutdown_sentinel(state: dict) -> None:
 async def main() -> int:
     """Open store + lock, prewarm embedder, serve socket, tick forever.
 
+
     Returns 0 on clean shutdown (signal-driven OR Hibernation transition);
     returns 1 only on LifecycleLockConflict (a same-host live-PID conflict);
+
     raises SystemExit(2) on partial-migration boot block. Signals
+
     SIGTERM/SIGINT/SIGHUP all set the shutdown event.
 
+
     Tasks spawned (post-Phase-10.6):
-    - mcp_socket_task:       SocketServer.serve() — SOLE binder of
+    - mcp_socket_task: SocketServer.serve — SOLE binder of
                              ~/.iai-mcp/.daemon.sock.
-    - tick_task:             scheduler tick loop (_scheduler_tick + _tick_body)
-                             for legacy REM cycles. Plan 10.6-01
-                             Task 1.4: the _should_yield_to_mcp gate inside
+    - tick_task: scheduler tick loop (_scheduler_tick + _tick_body)
+                             for legacy REM cycles. The _should_yield_to_mcp gate inside
                              _tick_body has been removed; the lifecycle
                              state machine supersedes the in-process yield.
-    - audit_task:            continuous_audit (C6, MVCC reads).
-    - s4_task:               hourly S4 offline pass.
-    - cascade_task:          TOK-14 HIPPEA activation-cascade
+    - audit_task: continuous_audit (C6, MVCC reads).
+    - s4_task: hourly S4 offline pass.
+    - cascade_task: HIPPEA activation-cascade
                              pre-warmer.
-    - cpu_watchdog_task:     Plan 07.2-05 R5 — observation-only CPU watchdog.
-    - lifecycle_tick_task:   Plan 10.6-01 Task 1.5 — drives the
+    - cpu_watchdog_task: observation-only CPU watchdog.
+    - lifecycle_tick_task: drives the
                              WAKE/DROWSY/SLEEP/HIBERNATION state machine
                              every 30 s; runs sleep_pipeline on SLEEP
                              entry; sets the global shutdown event on
                              HIBERNATION (with shadow_run=False).
 
+
     Removed in Task 1.4:
-    - idle_propagator_task   (was the bridge from socket idle_watcher to
+    - idle_propagator_task (was the bridge from socket idle_watcher to
                              the global shutdown event; idle_watcher itself
                              gone).
-    - rss_watchdog_task      (Phase 07.8 RSS-watchdog; Hibernation now
+    - rss_watchdog_task (RSS-watchdog; Hibernation now
                              provides "kill the process to drop RSS").
     """
-    # the daemon is a long-lived reader while MCP tool calls write
+    # F-05: the daemon is a long-lived reader while MCP tool calls write
     # to the same LanceDB directory from short-lived processes. Without
     # an explicit consistency interval the daemon's connection pins the
     # manifest snapshot it read at startup and every tick's
@@ -1085,18 +1163,19 @@ async def main() -> int:
     except Exception:
         pass
 
-    # Plan 07.11-03 / boot-time partial-migration detector. Closes the
+    # boot-time partial-migration detector. Closes the
     # V2-07 anti-pattern of declared-but-unwired knobs — the rollback handler
     # in migrate.py only fires if it's actually called from the boot path.
     # Placed BEFORE the embedder prewarm so a partial-state boot short-
     # circuits before paying the ~10s model-load cost.
     #
+
     # State machine (see migrate.detect_partial_migration):
-    #   - clean / unknown          -> proceed to ready advertisement.
-    #   - needs_cleanup            -> drop records_old_<ts>, then proceed.
-    #   - needs_rollback           -> STOP daemon; surface remediation prompt.
-    #   - partial_swap_inconsistent -> STOP daemon; surface remediation prompt
-    #                                  (manual recovery; no rollback anchor).
+    # - clean / unknown -> proceed to ready advertisement.
+    # - needs_cleanup -> drop records_old_<ts>, then proceed.
+    # - needs_rollback -> STOP daemon; surface remediation prompt.
+    # - partial_swap_inconsistent -> STOP daemon; surface remediation prompt
+    # (manual recovery; no rollback anchor).
     from iai_mcp.migrate import detect_partial_migration
     _migration_state = detect_partial_migration(store.db)
     if _migration_state["state"] == "partial_swap_inconsistent":
@@ -1161,7 +1240,7 @@ async def main() -> int:
 
     lock = ProcessLock()
 
-    # Plan 10.6-01 Task 1.5: acquire the single-machine
+    # acquire the WAKE-13 single-machine
     # lockfile (~/.iai-mcp/.locked). This is DISTINCT from `lock`
     # (ProcessLock fcntl flock that guards LanceDB writers); the
     # lifecycle lock is a higher-level, human-readable singleton marker
@@ -1180,11 +1259,11 @@ async def main() -> int:
     state = load_state()
     state.setdefault("fsm_state", STATE_WAKE)
     state["daemon_started_at"] = datetime.now(timezone.utc).isoformat()
-    # R5: stamp monotonic boot time so CPU watchdog payload
+    # .2 R5: stamp monotonic boot time so CPU watchdog payload
     # can include uptime_sec. Module-level global; written here only.
     global _daemon_started_monotonic
     _daemon_started_monotonic = time.monotonic()
-    # D7-11(a) revised: stamp daemon_pid into the state file so
+    # (a) revised: stamp daemon_pid into the state file so
     # `iai-mcp doctor` check (a) can read the live PID. The fcntl `.lock`
     # file holds zero PID bytes, so a separate source of truth is required.
     # On graceful shutdown the finally block clears this key (see below).
@@ -1192,8 +1271,8 @@ async def main() -> int:
     save_state(state)
     write_event(store, "daemon_started", {"state": state["fsm_state"]})
 
-    # L5: consume any pending wake.signal written by the MCP
-    # wrapper while the daemon was down. Plan 10.6-01
+    # .5 L5: consume any pending wake.signal written by the MCP
+    # wrapper while the daemon was down. .6
     # Task 1.5 wires the result into the lifecycle state machine: a
     # consumed wake_signal dispatches WAKE_SIGNAL to the LSM (which
     # transitions HIBERNATION -> WAKE if needed; no-op on cold boot
@@ -1214,11 +1293,11 @@ async def main() -> int:
         # Defensive: never block daemon boot on a wake-handler error.
         pass
 
-    # Plan 10.6-01 Task 1.5: drain any capture-queue records
+    # drain any capture-queue records
     # buffered by the wrapper while the daemon was hibernated. The
     # queue is the durable WRITE-side buffer that makes Hibernation
-    # viable. Records are routed back through the
-    # existing capture path so the verbatim contract (Phase 5/6) is
+    # viable . Records are routed back through the
+    # existing capture path so the verbatim contract is
     # preserved end-to-end.
     try:
         from iai_mcp.capture import capture_turn as _capture_turn
@@ -1261,13 +1340,14 @@ async def main() -> int:
         except Exception:
             pass
 
-    # R3 / D7.2-09 (a) startup-prune: drain any first_turn_pending
+    # startup-prune: drain any first_turn_pending
     # entries that are older than FIRST_TURN_PENDING_TTL_SEC_DEFAULT (1h).
     # The user's machine on 2026-04-27 had 11 stale entries (oldest 16h+)
     # before launchctl unload — each one perpetually retriggered the HIPPEA
     # cascade. Pruning at boot resets the slate; the per-tick prune (in
     # _tick_body Step 0.5) keeps it clean during long-running daemons.
     #
+
     # We pass an explicit `now=` kwarg (rather than letting the helper
     # default to `datetime.now(timezone.utc)`) so the helper's behaviour
     # is fully deterministic from the caller's perspective. Tests of the
@@ -1299,12 +1379,12 @@ async def main() -> int:
             except Exception:
                 pass
     except Exception:
-        # Drain failure must never block daemon startup. D7.1-04
+        # Drain failure must never block daemon startup.
         # established this exception-isolation discipline for startup-side
         # work.
         pass
 
-    # R3 / D7.1-04: drain any deferred-captures JSONL files that
+    # drain any deferred-captures JSONL files that
     # piled up in ~/.iai-mcp/.deferred-captures/ while we were down. Stop-hook
     # invocations of `iai-mcp capture-transcript --no-spawn` defer to disk
     # when the daemon socket is unreachable; this is the daemon-side reader
@@ -1312,8 +1392,9 @@ async def main() -> int:
     # SLEEP transition inside _tick_body re-runs drain to catch files
     # written while the daemon was asleep but not yet exited.
     #
+
     # Wrapped in try/except that NEVER propagates: a malformed deferred
-    # file or a bug in capture_turn() must not block daemon startup. Per-
+    # file or a bug in capture_turn must not block daemon startup. Per-
     # file errors are isolated inside drain_deferred_captures (renames the
     # offender to .failed-<ts>.jsonl).
     try:
@@ -1347,17 +1428,18 @@ async def main() -> int:
             # Windows / non-main-thread: no signal handlers.
             pass
 
-    # R2 / D7.3-10: one-shot Lance storage optimize at startup,
+    # one-shot Lance storage optimize at startup,
     # BEFORE the SocketServer binds and any tasks are created. Rationale:
     # (a) collapses any pre-existing version bloat before the first task
     # touches records.lance (the smoking-gun forensic case 2026-04-27 was
     # 10,841 versions / 3.66 GB on records.lance accumulated over 9 days);
     # (b) by definition no MCP client has connected yet so the 33-second
     # I/O cannot interfere with any user-facing work; (c) the helper itself
-    # never raises (D7.3-09) and the wrapping try/except is belt-and-braces
+    # never raises and the wrapping try/except is belt-and-braces
     # so a corrupt LanceDB cannot block daemon boot.
     #
-    # Plan 10.6-01 Task 1.4: REMOVED the
+
+    # REMOVED the
     # IAI_MCP_SKIP_STARTUP_OPTIMIZE env override path. Sleep_pipeline
     # step 4 (OPTIMIZE_LANCE) and step 5 (COMPACT_RECORDS) handle
     # version-bloat collapse during the SLEEP state, so the synchronous
@@ -1380,27 +1462,28 @@ async def main() -> int:
             severity="info",
         )
     except Exception:
-        # D7.3-09: maintenance MUST NOT crash daemon boot.
+        # maintenance MUST NOT crash daemon boot.
         pass
 
-    # D7-17 (LOCKED): SocketServer is the SINGLE
+    # (lines 83-85, LOCKED): SocketServer is the SINGLE
     # binder of ~/.iai-mcp/.daemon.sock. The pre-Phase-7 concurrency.serve_control_socket
     # has been REMOVED from this gather block — both servers calling
     # asyncio.start_unix_server on the same SOCKET_PATH would EADDRINUSE on the
     # second bind and the daemon would fail to start. Backward compat for the 7
-    # control messages is preserved inside SocketServer.handle()'s
+    # control messages is preserved inside SocketServer.handle's
     # dispatcher fork (jsonrpc=='2.0' → core.dispatch; 'type' in
     # CONTROL_MSG_TYPES → forward to concurrency._dispatch_socket_request).
     # concurrency.serve_control_socket function STAYS defined in concurrency.py
     # for test-compat per D7-17 final paragraph; scheduled for cleanup
     # once the 1226-test suite is migrated.
     #
-    # D7-06, R1: full MCP-method routing over unix socket.
+
+    # , R1: full MCP-method routing over unix socket.
     # idle_secs defaults to env IAI_DAEMON_IDLE_SHUTDOWN_SECS or 1800 (D7-05).
     mcp_socket = SocketServer(store, lock=lock, state=state)
     mcp_socket_task = asyncio.create_task(mcp_socket.serve())
 
-    # Plan 10.6-01 Task 1.4: REMOVED `_propagate_idle_shutdown`
+    # REMOVED `_propagate_idle_shutdown`
     # bridge task. The socket-side `idle_watcher` (which set
     # mcp_socket.shutdown_event after IDLE_CHECK_INTERVAL_SECS of
     # inactivity) has also been removed in this phase. The lifecycle
@@ -1408,7 +1491,7 @@ async def main() -> int:
     # down" responsibility via the heartbeat scanner + idle detector
     # + Hibernation transition.
 
-    # Plan 10.6-01 Task 1.5: initialise the lifecycle state
+    # initialise the lifecycle state
     # machine + heartbeat scanner + idle detector + sleep pipeline.
     # All four are stdlib-only / no new deps. The state machine reads
     # / writes ~/.iai-mcp/lifecycle_state.json via fcntl flock. Task
@@ -1454,7 +1537,7 @@ async def main() -> int:
         _scheduler_tick(store, lock, state, mcp_socket=mcp_socket)
     )
     audit_task = asyncio.create_task(
-        # Plan 10.6-01 Task 1.4: dropped the `socket=` kwarg
+        # dropped the `socket=` kwarg
         # — `_should_yield_to_mcp` is gone. `continuous_audit`'s
         # periodic Lance optimize body now runs unconditionally once
         # the cooldown gate passes; SLEEP-state coexistence is
@@ -1464,16 +1547,16 @@ async def main() -> int:
     s4_task = asyncio.create_task(
         _s4_offline_loop(store, shutdown)
     )
-    # TOK-14 D5-05: HIPPEA activation-cascade loop.
+    # HIPPEA activation-cascade loop.
     cascade_task = asyncio.create_task(
         _hippea_cascade_loop(store, shutdown)
     )
 
-    # Plan 07.2-05 R5 / D7.2-16: CPU watchdog (observation-only).
+    # CPU watchdog (observation-only).
     cpu_watchdog_task = asyncio.create_task(
         _cpu_watchdog_loop(store, shutdown)
     )
-    # Plan 10.6-01 Task 1.4: REMOVED the rss_watchdog_task.
+    # REMOVED the rss_watchdog_task.
     # `_rss_watchdog_loop` / `_clean_shutdown_for_restart` /
     # `_should_restart` were the legacy mechanism for unbounded RSS;
     # the lifecycle state machine's Hibernation transition now
@@ -1481,18 +1564,18 @@ async def main() -> int:
     # natural consequence of the WAKE -> DROWSY -> SLEEP -> HIBERNATION
     # progression.
 
-    # Plan 10.6-01 Task 1.5: lifecycle TICK loop.
+    # lifecycle TICK loop.
     # Cadence: 30 seconds (no busy loops; idle CPU near zero).
     # Responsibilities per CONTEXT 10.6:
-    #   1. Poll heartbeat scanner + idle detector.
-    #   2. Dispatch HEARTBEAT_REFRESH / IDLE_5MIN / IDLE_30MIN events
-    #      to the state machine based on observed activity.
-    #   3. When state == SLEEP, run sleep_pipeline.run with an
-    #      `interrupt_check` lambda that reads MCP socket activity.
-    #      On natural completion, dispatch SLEEP_CYCLE_DONE so the
-    #      state machine transitions to HIBERNATION.
-    #   4. When state == HIBERNATION (with shadow_run=False), set
-    #      the global shutdown event so main() exits gracefully.
+    # 1. Poll heartbeat scanner + idle detector.
+    # 2. Dispatch HEARTBEAT_REFRESH / IDLE_5MIN / IDLE_30MIN events
+    # to the state machine based on observed activity.
+    # 3. When state == SLEEP, run sleep_pipeline.run with an
+    # `interrupt_check` lambda that reads MCP socket activity.
+    # On natural completion, dispatch SLEEP_CYCLE_DONE so the
+    # state machine transitions to HIBERNATION.
+    # 4. When state == HIBERNATION (with shadow_run=False), set
+    # the global shutdown event so main exits gracefully.
 
     LIFECYCLE_TICK_INTERVAL_SEC: float = 30.0
     DROWSY_AFTER_SEC: float = float(
@@ -1513,12 +1596,15 @@ async def main() -> int:
     # the persistent-side record, but we also keep a monotonic
     # baseline here for the IDLE_5MIN / IDLE_30MIN thresholds.
     _last_active_monotonic: list[float] = [time.monotonic()]
+    # Previous-tick lifecycle state for WAKE -> DROWSY edge detection.
+    _prev_lifecycle_state: list = [_LifecycleState.WAKE]
 
     async def lifecycle_tick() -> None:
         """Periodic lifecycle event dispatcher.
 
+
         Called every LIFECYCLE_TICK_INTERVAL_SEC seconds (30 s).
-        Cancellation-safe via asyncio.wait_for(shutdown.wait(), ...).
+        Cancellation-safe via asyncio.wait_for(shutdown.wait, ...).
         """
         while not shutdown.is_set():
             try:
@@ -1565,8 +1651,24 @@ async def main() -> int:
                     _state_machine.dispatch(_LifecycleEvent.IDLE_5MIN)
 
                 # 2. If state is now SLEEP, run the sleep pipeline
-                #    with bounded deferral.
+                # with bounded deferral.
                 current = _state_machine.current_state
+                # WAKE -> DROWSY edge: drain deferred captures once per
+                # entry. Guarded by _prev_lifecycle_state so consecutive
+                # DROWSY ticks do not re-fire.
+                if _should_drain_on_drowsy_edge(_prev_lifecycle_state[0], current):
+                    try:
+                        from iai_mcp.capture import drain_deferred_captures
+
+                        await asyncio.to_thread(
+                            _run_drowsy_drain,
+                            store,
+                            drain_fn=drain_deferred_captures,
+                            write_event_fn=write_event,
+                        )
+                    except Exception:
+                        pass
+                _prev_lifecycle_state[0] = current
                 if current is _LifecycleState.SLEEP:
                     def _interrupt_check() -> bool:
                         # Bounded deferral: fire the interrupt if
@@ -1605,8 +1707,8 @@ async def main() -> int:
                         )
 
                 # 3. If state is HIBERNATION and shadow_run=False,
-                #    set the global shutdown event. main()'s finally
-                #    block will release the lifecycle lock and exit 0.
+                # set the global shutdown event. main's finally
+                # block will release the lifecycle lock and exit 0.
                 current = _state_machine.current_state
                 if (
                     current is _LifecycleState.HIBERNATION
@@ -1637,7 +1739,7 @@ async def main() -> int:
     try:
         await shutdown.wait()
     finally:
-        # Plan 10.6-01 Task 1.4: simplified shutdown set.
+        # simplified shutdown set.
         # `idle_propagator_task` and `rss_watchdog_task` are gone; the
         # remaining 6 tasks (mcp_socket + tick + audit + s4 + cascade
         # + cpu_watchdog) form the cancel set. Trigger SocketServer's
@@ -1662,7 +1764,7 @@ async def main() -> int:
         except Exception:
             pass
         # Persist final state so next boot sees a clean shutdown marker.
-        # Plan 10.6-01 Task 1.4: clear the on-disk
+        # clear the on-disk
         # user_requested_shutdown sentinel so it does not leak across
         # boots. Exit code is uniformly 0 — the plist's KeepAlive=
         # {"Crashed": true} ensures graceful 0 stays dead until wrapper
@@ -1674,14 +1776,14 @@ async def main() -> int:
             save_state(state)
         except Exception:
             pass
-        # Plan 10.6-01 Task 1.5: release the lifecycle lockfile
-        # so the next daemon boot can acquire cleanly. release() is
+        # release the lifecycle lockfile
+        # so the next daemon boot can acquire cleanly. release is
         # idempotent.
         try:
             lifecycle_lock.release()
         except Exception:
             pass
-        # Clean uninstall invariant: release + close the fcntl fd.
+        # Clean uninstall invariant (C4): release + close the fcntl fd.
         lock.close()
     return 0
 

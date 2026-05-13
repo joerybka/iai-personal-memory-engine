@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# IAI-MCP Stop hook — ambient WRITE-side capture (Plan 06 + Phase 7.1).
+# IAI-MCP Stop hook — ambient WRITE-side capture.
 #
 # Fires when a Claude Code session ends. Reads the session's JSONL transcript,
 # batch-captures user + assistant turns into the iai-mcp episodic tier through
-# `iai-mcp capture-transcript --no-spawn`. NEVER spawns a daemon (Phase 7.1 R3).
+# `iai-mcp capture-transcript --no-spawn`. NEVER spawns a daemon.
 # If the daemon is unreachable, the call defers events to
 # ~/.iai-mcp/.deferred-captures/ for the daemon to drain on next socket
 # activation (handled by drain_deferred_captures in daemon.main + _tick_body
-# WAKE handler — Plan 07.1-06).
+# WAKE handler).
 #
 # Fail-safe by design: any error exits 0 so session teardown is never blocked.
 # Logs go to ~/.iai-mcp/logs/capture-YYYY-MM-DD.log for audit.
@@ -84,32 +84,34 @@ if [[ -f "$cli_cache" ]]; then
   [[ -x "$cached" ]] && iai_cli="$cached"
 fi
 if [[ -z "$iai_cli" ]]; then
-  # Resolve via PATH first (covers ~/.local/bin/iai-mcp installed by scripts/install.sh)
-  path_cli="$(command -v iai-mcp 2>/dev/null || true)"
-  if [[ -n "$path_cli" && -x "$path_cli" ]]; then
-    iai_cli="$path_cli"
-  else
-    # Fall back to common clone locations
-    for candidate in \
-      "$HOME/.local/bin/iai-mcp" \
-      "$HOME/iai-mcp/.venv/bin/iai-mcp" \
-      "$HOME/IAI-MCP/.venv/bin/iai-mcp" \
-      "/usr/local/bin/iai-mcp" \
-      "/opt/homebrew/bin/iai-mcp"; do
-      if [[ -x "$candidate" ]]; then
-        iai_cli="$candidate"
-        break
-      fi
-    done
-  fi
-  if [[ -n "$iai_cli" ]]; then
-    printf '%s' "$iai_cli" > "$cli_cache" 2>/dev/null || true
-  fi
+  for candidate in \
+    "$HOME/IAI-MCP/.venv/bin/iai-mcp" \
+    "/usr/local/bin/iai-mcp"; do
+    if [[ -x "$candidate" ]]; then
+      iai_cli="$candidate"
+      printf '%s' "$iai_cli" > "$cli_cache" 2>/dev/null || true
+      break
+    fi
+  done
 fi
 
 if [[ -z "$iai_cli" ]]; then
   echo "$ts skipped: iai-mcp CLI not found" >> "$log" 2>/dev/null
   exit 0
+fi
+
+# Atomically rename the active-writer marker so the drain can see it on the
+# next WAKE/DROWSY pass. Target name uses `.live-${epoch}.jsonl` so it never
+# collides with the safety-net output shape `${session_id}-${epoch}.jsonl`
+# in the same second. Also clean the per-session offset state — the session
+# is ending, no further per-turn writes will reference it.
+if [[ -n "$session_id" ]]; then
+  live_file="$HOME/.iai-mcp/.deferred-captures/${session_id}.live.jsonl"
+  if [[ -f "$live_file" ]]; then
+    mv "$live_file" "$HOME/.iai-mcp/.deferred-captures/${session_id}.live-$(date +%s).jsonl" 2>/dev/null || true
+  fi
+  offset_state="$HOME/.iai-mcp/.capture-state/${session_id}.offset"
+  [[ -f "$offset_state" ]] && rm -f "$offset_state" 2>/dev/null
 fi
 
 # Run capture with a 30s hard timeout — if it hangs, the session must still

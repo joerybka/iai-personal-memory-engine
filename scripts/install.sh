@@ -40,28 +40,8 @@ else
     # 1. venv
     # -----------------------------------------------------------------------
     step "python venv"
-    # iai-mcp requires Python 3.11 or 3.12 (torch + lancedb on 3.13/3.14
-    # are not yet stable). Pick the highest supported interpreter we can find.
-    PY=""
-    for cand in python3.12 python3.11; do
-        if command -v "$cand" >/dev/null 2>&1; then
-            PY="$(command -v $cand)"
-            break
-        fi
-    done
-    if [ -z "$PY" ]; then
-        # Fall back to plain python3 only if it self-reports as 3.11 or 3.12.
-        if command -v python3 >/dev/null 2>&1; then
-            ver="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo unknown)"
-            if [ "$ver" = "3.11" ] || [ "$ver" = "3.12" ]; then
-                PY="$(command -v python3)"
-            fi
-        fi
-    fi
-    [ -n "$PY" ] || die "Python 3.11 or 3.12 not found. macOS:  brew install python@3.12   |   Linux:  apt install python3.12 (or use pyenv)"
-    ok "using $PY ($($PY --version))"
     if [ ! -d .venv ]; then
-        "$PY" -m venv .venv
+        python3 -m venv .venv
         ok ".venv created"
     else
         ok ".venv already exists"
@@ -151,13 +131,13 @@ fi
 # ---------------------------------------------------------------------------
 # 6. LaunchAgent registration (Phase 7.1 — socket-activated singleton)
 #
-# Section 6 — socket-activated LaunchAgent. REPLACES the eager
-# RunAtLoad=true plist that `iai-mcp daemon install` writes.
+# Section 6 (Phase 7.1) — socket-activated LaunchAgent. REPLACES the eager
+# RunAtLoad=true plist that Plan 04-05 `iai-mcp daemon install` writes.
 # The two flows compete for ~/Library/LaunchAgents/com.iai-mcp.daemon.plist;
-# whichever ran most recently wins. install.sh always wins because
+# whichever ran most recently wins. Phase 7.1 install.sh always wins because
 # it overwrites + reloads on every invocation (idempotent by design).
 # ---------------------------------------------------------------------------
-step "LaunchAgent registration"
+step "LaunchAgent registration (Phase 7.1)"
 if [[ "$(uname)" != "Darwin" ]]; then
     warn "non-Darwin OS — skipping LaunchAgent registration"
 elif [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -176,6 +156,13 @@ else
     # Substitute placeholders using sed; HOME/PYTHON_PATH may contain forward
     # slashes so we use `|` as the sed separator (not `/`).
     sed -e "s|{PYTHON_PATH}|${PYTHON_PATH}|g" -e "s|{HOME}|${HOME}|g" "${TEMPLATE}" > "${LA_PATH}"
+    if [ ! -f "${HOME}/.iai-mcp/.crypto.key" ] && [ -z "${IAI_MCP_CRYPTO_PASSPHRASE:-}" ]; then
+        if "${REPO_ROOT}/.venv/bin/iai-mcp" crypto init >/dev/null 2>&1; then
+            ok "crypto key generated (~/.iai-mcp/.crypto.key)"
+        else
+            warn "crypto init failed — run \`iai-mcp crypto init\` manually"
+        fi
+    fi
     # Idempotent: unload prior registration if any, then load fresh. -w persists across reboots.
     launchctl unload -w "${LA_PATH}" 2>/dev/null || true
     if ! launchctl load -w "${LA_PATH}"; then

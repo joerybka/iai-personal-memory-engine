@@ -1,6 +1,6 @@
-"""Phase 7.1 Plan 06 / R3 closure — `drain_deferred_captures(store)` daemon-side.
+"""/ R3 closure — `drain_deferred_captures(store)` daemon-side.
 
-Plan 07.1-05 shipped the WRITE side (`iai-mcp capture-transcript --no-spawn`
+shipped the WRITE side (`iai-mcp capture-transcript --no-spawn`
 writes JSONL files to ``~/.iai-mcp/.deferred-captures/`` when the daemon
 socket is unreachable). This plan ships the READ side: a drain function that
 the daemon runs at startup AND on every WAKE-from-SLEEP transition, so
@@ -115,7 +115,7 @@ def _write_deferred_jsonl(
 ) -> Path:
     """Construct a v1 JSONL file under ``deferred_dir`` and return its Path.
 
-    Mirrors the format ``write_deferred_captures`` produces (Plan 07.1-05).
+    Mirrors the format ``write_deferred_captures`` produces .
     Header on line 1; events on lines 2..N.
     """
     deferred_dir.mkdir(parents=True, exist_ok=True)
@@ -339,7 +339,7 @@ def test_drain_multiple_files_processed_in_order(iai_home):
     from iai_mcp.capture import drain_deferred_captures
 
     deferred_dir = iai_home / ".iai-mcp" / ".deferred-captures"
-    # NOTE: 07.11-01 Rule 1 deviation -- before Plan 07.11-01 these three
+    # NOTE: 07.11-01 Rule 1 deviation -- before these three
     # lexically-near cues all looked unique because the dedup branch in
     # capture_turn was unreachable dead code (Bugs A/B/C). After the dedup
     # fix, bge-small-en-v1.5 places "test cue: event from file 0/1/2" above

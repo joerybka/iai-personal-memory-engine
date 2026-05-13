@@ -1,4 +1,4 @@
-"""Session-start assembler (D-10 budget, OPS-01, continuity).
+"""Session-start assembler — token-budgeted cached prefix for MCP session continuity.
 
 Produces the 4-segment cached prefix that Claude's MCP wrapper places in front
 of every request under Anthropic 1h-TTL prompt caching:
@@ -6,11 +6,11 @@ of every request under Anthropic 1h-TTL prompt caching:
     L0          -- pinned identity kernel (always includes the user's L0 record)
     L1          -- critical-facts block (pinned + high-detail records)
     L2[...]     -- Yeo-like community summaries (top MAX_TOP_COMMUNITIES=7)
-    rich_club   -- global hub prefetch (CONN-02 rich-club nodes)
+    rich_club   -- global hub prefetch (rich-club nodes)
 
-Plan 03-02 (M6 LIVE prerequisite): assemble_session_start emits
-``kind='session_started'`` with a deterministic ``session_state_hash`` so
-M6 context-repeat-rate can be computed live from production emits.
+`assemble_session_start` emits ``kind='session_started'`` with a deterministic
+``session_state_hash`` so context-repeat-rate can be computed live from
+production emits.
 
 Budget breakdown:
     L0_BUDGET_TOKENS           =   80
@@ -18,16 +18,16 @@ Budget breakdown:
     L2_PER_COMMUNITY_TOKENS    =   50  (cap of 7 -> L2 totals ~350 tok)
     RICH_CLUB_BUDGET_TOKENS    = 1500
     TOTAL_CACHED_BUDGET        = 2000
-    (plus ~1000 tok dynamic tail per -> steady-state <= 3000)
+    (plus ~1000 tok dynamic tail -> steady-state <= 3000)
 
 Tokens are counted via a local `_approx_tokens(text) = max(1, len(text) // 4)`
 heuristic that matches Anthropic's documented rough ratio; bench/tokens.py
 cross-validates with the real `count_tokens` API when ANTHROPIC_API_KEY is
 available.
 
-OPS-05 observable: `payload.l0` always contains the substring "IAI-MCP" when the
-pinned L0 record is present, so the verifier can assert identity continuity
-on a fresh session open.
+Identity continuity observable: `payload.l0` always contains the pinned L0
+record's literal surface when the record is present, so the verifier can assert
+identity continuity on a fresh session open.
 """
 from __future__ import annotations
 
@@ -41,16 +41,16 @@ from iai_mcp.store import MemoryStore
 from iai_mcp.types import MemoryRecord
 
 
-# ------------------------------------------------------------- budgets
+# -------------------------------------------------------------- token budgets
 L0_BUDGET_TOKENS = 80
 L1_BUDGET_TOKENS = 200
 L2_PER_COMMUNITY_TOKENS = 50
-L2_COMMUNITY_CAP = 7          # CONN-01 Yeo-like cap
+L2_COMMUNITY_CAP = 7          # Yeo-like community cap
 RICH_CLUB_BUDGET_TOKENS = 1500
 TOTAL_CACHED_BUDGET = 2000    # L0 + L1 + L2 + rich_club <= this
 DYNAMIC_TAIL_TOKENS = 1000    # reserve for per-turn tool results
 
-# Pinned L0 UUID (D-14, matches core._seed_l0_identity).
+# Pinned L0 UUID (matches core._seed_l0_identity).
 L0_RECORD_UUID = UUID("00000000-0000-0000-0000-000000000001")
 
 
@@ -59,17 +59,16 @@ L0_RECORD_UUID = UUID("00000000-0000-0000-0000-000000000001")
 
 @dataclass
 class SessionStartPayload:
-    """Cached prefix + metadata (D-10 + TOK-11 lazy fields).
+    """Cached prefix + metadata, including lazy pointer fields for minimal mode.
 
     `breakpoint_marker` is where the TS wrapper splits stable vs volatile
-    content before applying Anthropic `cache_control` (TOK-01). The Python
-    side never inserts it into the segment strings -- it's just a sentinel
-    string the TS side recognises.
+    content before applying Anthropic `cache_control`. The Python side never
+    inserts it into the segment strings -- it's just a sentinel string the TS
+    side recognises.
 
-    D5-02: three new pointer fields populated at
-    `wake_depth=minimal` (the new default); legacy l0/l1/l2/rich_club left
-    empty at minimal mode. `wake_depth` is echoed so the client knows
-    which mode produced the payload.
+    Three pointer fields are populated at `wake_depth=minimal` (the default);
+    legacy l0/l1/l2/rich_club are left empty at minimal mode. `wake_depth` is
+    echoed so the client knows which mode produced the payload.
     """
 
     l0: str = ""
@@ -79,14 +78,14 @@ class SessionStartPayload:
     total_cached_tokens: int = 0
     total_dynamic_tokens: int = 0
     breakpoint_marker: str = "--<cache-breakpoint>--"
-    # D5-02 — lazy session-start fields (<=30 raw tok combined).
+    # Lazy session-start fields (<=30 raw tok combined).
     identity_pointer: str = ""       # "<id:{8-hex-of-L0-uuid}>" (~8 tok)
     brain_handle: str = ""           # "<sess:{8-hex} pend:{N}>" (~12 tok)
     topic_cluster_hint: str = ""     # "<topic:{community_label}>" (~8 tok)
-    # — single compact handle, ≤16 raw tok target. At
-    # `wake_depth=minimal` this supersedes the three legacy pointers above
-    # (they are left empty to keep the budget tight); `standard`/`deep`
-    # populate BOTH the compact handle and the legacy fields for back-compat.
+    # Single compact handle, ≤16 raw tok target. At `wake_depth=minimal` this
+    # supersedes the three legacy pointers above (they are left empty to keep
+    # the budget tight); `standard`/`deep` populate BOTH the compact handle and
+    # the legacy fields for back-compat.
     compact_handle: str = ""         # "<iai:{16-hex-blake2s}>" (~6-10 raw tok)
     wake_depth: str = "minimal"      # echoed for introspection
 
@@ -112,7 +111,7 @@ def _resolve_compact_handle_to_pointers(handle: str) -> tuple[str, str, str] | N
     triple from a compact ``<iai:HHHHHHHHHHHHHHHH>`` handle minted earlier in
     this process.
 
-    no-info-loss proof: everything the 3-field shape conveyed is
+    No information is lost: everything the 3-field shape conveyed is
     recoverable from the compact handle via the LRU in ``iai_mcp.handle`` ---
     identity prefix, session prefix, topic label and pending count. Returns
     ``None`` when the handle is malformed OR the LRU has evicted the record,
@@ -140,7 +139,7 @@ def _fetch_record(store: MemoryStore, uid: UUID) -> MemoryRecord | None:
 
 
 def _l0_segment(store: MemoryStore) -> str:
-    """OPS-05 identity kernel -- the pinned L0 record by fixed UUID.
+    """Identity kernel -- the pinned L0 record by fixed UUID.
 
     Returned string shape: "<aaak_index>\n<literal_surface[:200]>". Empty when
     the L0 record hasn't been seeded yet (fresh stores before first core boot).
@@ -222,8 +221,8 @@ def _l2_segments(
         line = f"[community {str(cid)[:8]}] {body}"
         if len(line) > max_chars:
             line = line[:max_chars]
-        # LLMLingua-2 compression on L2 community
-        # descriptors. Passthrough when package absent (see compress.py).
+        # LLMLingua-2 compression on L2 community descriptors.
+        # Passthrough when package absent (see compress.py).
         try:
             from iai_mcp.compress import compress_l2_descriptor
             line = compress_l2_descriptor(line, store=store)
@@ -248,7 +247,7 @@ def _rich_club_segment_with_budget(
     *,
     budget: int,
 ) -> str:
-    """Rich-club summary with an explicit budget (Plan 05-03 deep mode).
+    """Rich-club summary with an explicit budget (used by deep mode).
 
     Same rendering as `_rich_club_segment`; `budget` replaces the default cap
     so wake_depth=deep can lift the rich_club allotment to ~2000 tok.
@@ -282,11 +281,11 @@ def _rich_club_segment_with_budget(
 
 
 def _session_state_hash(payload: SessionStartPayload) -> str:
-    """Plan 03-02 M6: deterministic SHA-256 over the 4-segment cached prefix.
+    """Deterministic SHA-256 over the 4-segment cached prefix.
 
     Two sessions whose L0 + L1 + L2 + rich_club segments are byte-identical
     produce the SAME session_state_hash -- which is exactly the
-    "context-repeat" signal M6 measures.
+    "context-repeat" signal measured by the context-repeat-rate metric.
     """
     import hashlib
     h = hashlib.sha256()
@@ -301,7 +300,7 @@ def _session_state_hash(payload: SessionStartPayload) -> str:
 
 
 def _dominant_community_label(assignment: CommunityAssignment) -> str:
-    """Plan 05-03 D5-02: short (<=8 char) label for the largest community.
+    """Short (<=8 char) label for the largest community.
 
     Returns 'none' when no communities exist (fresh or flat assignment). The
     label is the first 8 hex of the dominant community UUID — a stable handle
@@ -311,14 +310,14 @@ def _dominant_community_label(assignment: CommunityAssignment) -> str:
         top = list(assignment.top_communities)
         if not top:
             return "none"
-        # top_communities is already ordered by member count (CONN-01 L1).
+        # top_communities is already ordered by member count (largest first).
         return str(top[0])[:8]
     except Exception:
         return "none"
 
 
 def _count_pending_first_turn(store: MemoryStore) -> int:
-    """Plan 05-03 D5-02: count open first_turn_pending sessions in daemon_state.
+    """Count open first_turn_pending sessions in daemon_state.
 
     Returns 0 if daemon_state is missing or malformed (silent fallback). This
     is only cosmetic input to the brain_handle pointer; the minimal payload
@@ -345,25 +344,23 @@ def assemble_session_start(
 ) -> SessionStartPayload:
     """Assemble the session-start cached prefix.
 
-    TOK-11 / D5-02 / D5-10: branches on the `wake_depth` profile
-    knob (15th sealed knob, MCP-12):
+    Branches on the `wake_depth` profile knob:
 
     - ``minimal`` (default): produce a ≤30 raw-tok pointer handle (identity,
       brain session, topic cluster). Legacy l0/l1/l2/rich_club emitted empty
       for back-compat with existing TS-wrapper callers.
-    - ``standard``: reproduce the Phase-1 1388-tok eager dump — l0/l1/l2/
-      rich_club populated via `_l0_segment`, `_l1_segment`, `_l2_segments`,
-      `_rich_club_segment`. New fields emitted empty.
+    - ``standard``: eager 1388-tok dump — l0/l1/l2/rich_club populated via
+      `_l0_segment`, `_l1_segment`, `_l2_segments`, `_rich_club_segment`. New
+      fields emitted empty.
     - ``deep``: same shape as standard but rich_club budget lifted to 2000.
       Populates both the legacy segments and the new pointers.
 
-    (M6 LIVE prerequisite): emits ``kind='session_started'`` with
-    a deterministic ``session_state_hash`` over the cached prefix. Two
-    consecutive sessions whose cached prefix is identical produce the same
-    hash -- exactly the context-repeat signal M6 measures.
+    Emits ``kind='session_started'`` with a deterministic
+    ``session_state_hash`` over the cached prefix. Two consecutive sessions
+    whose cached prefix is identical produce the same hash -- exactly the
+    context-repeat signal measured by the context-repeat-rate metric.
 
-    Pitfall 1 (Anthropic cache threshold reality per 05-RESEARCH lines
-    447-469): at `wake_depth=minimal` the payload is ≤30 raw tok which is
+    Pitfall: at `wake_depth=minimal` the payload is ≤30 raw tok which is
     BELOW the Sonnet 4.6 / Opus 4.7 cache minimum (2048 / 4096). DO NOT add
     ``cache_control`` to the minimal branch prefix — it would be silently
     ignored by the Anthropic API and waste a breakpoint slot.
@@ -372,13 +369,13 @@ def assemble_session_start(
     state = profile_state if isinstance(profile_state, dict) else default_state()
     wake_depth = state.get("wake_depth", "minimal")
     if wake_depth not in ("minimal", "standard", "deep"):
-        wake_depth = "minimal"  # D5-10 silent fallback
+        wake_depth = "minimal"  # silent fallback for unrecognised values
 
     if wake_depth == "minimal":
         # Pitfall 1 guard: payload will not be Anthropic-cached
         # (<=30 raw tok < Sonnet 4.6 min 2048). DO NOT set cache_control.
         #
-        # collapse the three legacy pointers
+        # Collapse the three legacy pointers
         # (identity_pointer + brain_handle + topic_cluster_hint, ~24 raw tok
         # together) into a single `<iai:HHHHHHHHHHHHHHHH>` handle (~6-10 raw
         # tok). The LRU inside `iai_mcp.handle` retains the reverse mapping
@@ -414,7 +411,7 @@ def assemble_session_start(
             wake_depth="minimal",
         )
     else:
-        # standard and deep share the Phase-1 eager assembly path; deep lifts
+        # standard and deep share the eager assembly path; deep lifts
         # the rich_club budget by re-running the segment with a larger cap.
         l0 = _l0_segment(store)
         l1 = _l1_segment(store)
@@ -432,9 +429,9 @@ def assemble_session_start(
         )
 
         # New pointers also populated under standard/deep so downstream callers
-        # can use them alongside legacy segments if they want. Plan 05-06:
-        # the compact handle is ALSO minted here so a consumer can opt in to
-        # the short form without requiring a wake_depth mode switch.
+        # can use them alongside legacy segments if they want. The compact
+        # handle is ALSO minted here so a consumer can opt in to the short
+        # form without requiring a wake_depth mode switch.
         l0_rec = _fetch_record(store, L0_RECORD_UUID)
         identity_short = str(L0_RECORD_UUID)[:8] if l0_rec is not None else ""
         identity_pointer = f"<id:{identity_short}>" if identity_short else ""
@@ -461,9 +458,9 @@ def assemble_session_start(
             wake_depth=wake_depth,
         )
 
-    # (M6 LIVE prerequisite): emit kind='session_started' with
-    # session_state_hash for trajectory.m6_context_repeat_rate_live.
-    # Diagnostic-only: never block session start on emit failure.
+    # Emit kind='session_started' with session_state_hash for
+    # context-repeat-rate tracking. Diagnostic-only: never block session
+    # start on emit failure.
     try:
         from datetime import datetime, timezone
         from iai_mcp.events import write_event
@@ -484,3 +481,34 @@ def assemble_session_start(
         pass
 
     return payload
+
+
+def format_payload_as_markdown(payload: "SessionStartPayload | dict") -> str:
+    """Render the four-segment cached prefix as plain markdown.
+
+    Section order mirrors mcp-wrapper/src/caching.ts buildCachedSystemPrompt:
+    `# L0 identity`, `# L1 critical facts`, `# L2 community` (one block per
+    segment), `# Global rich-club`. Empty segments are skipped so the
+    rendered output is stable when, e.g., L1 is empty.
+    """
+    if isinstance(payload, dict):
+        l0 = payload.get("l0") or ""
+        l1 = payload.get("l1") or ""
+        l2 = list(payload.get("l2") or [])
+        rich_club = payload.get("rich_club") or ""
+    else:
+        l0 = payload.l0
+        l1 = payload.l1
+        l2 = list(payload.l2)
+        rich_club = payload.rich_club
+    blocks: list[str] = []
+    if l0:
+        blocks.append(f"# L0 identity\n{l0}")
+    if l1:
+        blocks.append(f"# L1 critical facts\n{l1}")
+    for seg in l2:
+        if seg:
+            blocks.append(f"# L2 community\n{seg}")
+    if rich_club:
+        blocks.append(f"# Global rich-club\n{rich_club}")
+    return "\n\n".join(blocks)

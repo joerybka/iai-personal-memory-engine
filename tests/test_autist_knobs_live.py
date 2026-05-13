@@ -152,8 +152,8 @@ def test_inertia_awareness_live():
 
 
 # removed test_double_empathy_live — (double_empathy)
-# was promoted to a passive system invariant (CLAUDE.md "Architectural
-# Invariants — Pinned"); the system never translates phrasing toward NT style
+# was promoted to a passive system invariant; the system never translates
+# phrasing toward NT style
 # at any path, so a runtime knob was redundant. Removed from registry.
 # See tests/test_profile_no_dead_knobs.py for the post-removal contract.
 

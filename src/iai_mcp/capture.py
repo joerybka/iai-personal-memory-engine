@@ -1,11 +1,7 @@
-"""Plan 06 memory_capture (WRITE-side ambient gap closure).
+"""memory_capture — WRITE-side ambient capture.
 
-Context: prior phases shipped ambient READ (session_start compact handle) and
-ambient daemon (sleep cycles, REM, overnight digest). WRITE-side capture of
-conversation content was architectural gap — nothing in iai-mcp automatically
-ingested what the user said or what Claude decided during a session.
-
-This module closes that gap with two entry points:
+This module provides two entry points for capturing conversation content
+into the iai-mcp store:
 
 1. `capture_turn(store, cue, text, tier, session_id)`:
    in-session, explicit. Called via MCP tool `memory_capture` when Claude
@@ -31,19 +27,31 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-# R3 deviation [Rule 3 - blocking import cost]: `iai_mcp.embed` pulls
-# in transformers + torch (~2.9s cold import). Loading capture.py for the
-# `--no-spawn` deferred path (which never embeds anything) blew the R3 2s
-# wall-clock budget. Moved to lazy import inside `capture_turn` — keeps the
-# write_deferred_captures cold path under ~1s. `from __future__ import
-# annotations` (line 29) keeps type hints intact without runtime import.
-# `MemoryStore` left at module top — its 0.4s import is acceptable.
+# Per-pass event cap for drain_deferred_captures. When a single file would
+# push the running total past this threshold, the unprocessed remainder is
+# rewritten to {basename}.partial.jsonl (header preserved) for the next pass.
+MAX_DRAIN_EVENTS_PER_RUN = 5000
+
+# Matches the active-writer marker name shape exactly: `{anything}.live.jsonl`
+# with no hyphen-epoch between `.live` and `.jsonl`. The Stop-hook rename
+# target `{id}.live-{epoch}.jsonl` does NOT match (the `-` after `.live`
+# breaks the pattern).
+_LIVE_ACTIVE_RE = re.compile(r"\.live\.jsonl$")
+
+# Deviation: blocking import cost — `iai_mcp.embed` pulls in transformers +
+# torch (~2.9s cold import). Loading capture.py for the `--no-spawn` deferred
+# path (which never embeds anything) would exceed the 2s wall-clock budget.
+# Moved to lazy import inside `capture_turn` — keeps the write_deferred_captures
+# cold path under ~1s. `from __future__ import annotations` (line 29) keeps
+# type hints intact without runtime import. `MemoryStore` left at module top —
+# its 0.4s import is acceptable.
 from iai_mcp.store import MemoryStore
 from iai_mcp.types import (
     SCHEMA_VERSION_CURRENT,
@@ -82,47 +90,6 @@ def _run_shield(text: str) -> tuple[str, list[str]]:
         return "OK", []
 
 
-def _content_to_text(content: Any) -> str:
-    """Extract plain text from Claude and Codex content block shapes."""
-    if isinstance(content, list):
-        text_parts = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") in {"text", "input_text", "output_text"}:
-                text_parts.append(str(block.get("text", "")))
-        return "\n".join(text_parts).strip()
-    return str(content).strip()
-
-
-def _extract_transcript_turn(obj: dict[str, Any]) -> tuple[str, str] | None:
-    """Return (role, text) for supported Claude Code and Codex transcript rows."""
-    payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
-    obj_type = obj.get("type")
-
-    if obj_type == "response_item":
-        # Codex response_item message rows can include injected context and
-        # duplicate cleaner event_msg rows. Capture only event_msg turns.
-        return None
-
-    if obj_type == "event_msg":
-        payload_type = payload.get("type")
-        if payload_type == "user_message":
-            text = _content_to_text(payload.get("message", ""))
-            return ("user", text) if text else None
-        if payload_type == "agent_message":
-            text = _content_to_text(payload.get("message", ""))
-            return ("assistant", text) if text else None
-        return None
-
-    msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
-    role = obj_type if obj_type in {"user", "assistant"} else str(msg.get("role", ""))
-    if role not in {"user", "assistant"}:
-        return None
-    text = _content_to_text(msg.get("content", ""))
-    return (role, text) if text else None
-
-
 def capture_turn(
     store: MemoryStore,
     *,
@@ -151,19 +118,18 @@ def capture_turn(
         return {"status": "skipped", "record_id": None, "reason": "shield HARD_BLOCK"}
 
     # Lazy import: keeps the cold module-import cost low for the
-    # `--no-spawn` deferred path (Phase 7.1 R3) which never embeds.
+    # `--no-spawn` deferred path which never embeds.
     from iai_mcp.embed import embedder_for_store
 
     emb = embedder_for_store(store).embed(cue or text)
     embedding = list(emb)
 
     # Dedup: query_similar against existing records at the same tier.
-    # Phase 07.11-01 / query_similar accepts a `tier` kwarg natively
-    # (Bug A fix), returns list[tuple[MemoryRecord, float]] (legacy contract,
-    # unchanged shape -- we unpack the tuple correctly in the loop body, Bug B
-    # fix), and the dedup hit reinforces via the typed `reinforce_record`
-    # wrapper (Bug C fix -- single-uuid argument shape against a single-uuid
-    # API).
+    # query_similar accepts a `tier` kwarg natively, returns
+    # list[tuple[MemoryRecord, float]] (legacy contract, unchanged shape --
+    # we unpack the tuple correctly in the loop body), and the dedup hit
+    # reinforces via the typed `reinforce_record` wrapper (single-uuid
+    # argument shape against a single-uuid API).
     try:
         neighbours = store.query_similar(embedding, k=3, tier=tier)
     except (ValueError, IOError) as exc:
@@ -171,17 +137,17 @@ def capture_turn(
         # ValueError (already caught by query_similar's pre-I/O guard); transient
         # LanceDB I/O surfaces as IOError. A TypeError from a wrong call shape
         # MUST surface in tests -- the silent `except Exception: pass` blanket
-        # is removed deliberately (D-01 contract).
+        # is removed deliberately.
         log.warning(
             "capture_dedup_query_failed",
             extra={"err_type": type(exc).__name__, "err": str(exc)[:120]},
         )
         neighbours = []
 
-    for record, score in neighbours:  # tuple-unpack -- fix for Bug B
+    for record, score in neighbours:  # tuple-unpack (MemoryRecord, float)
         if score >= DEDUP_COS_THRESHOLD:
-            # Single-record reinforcement: route through reinforce_record
-            #, NOT boost_edges([UUID(...)]) which expects pairs.
+            # Single-record reinforcement: route through reinforce_record,
+            # NOT boost_edges([UUID(...)]) which expects pairs.
             try:
                 store.reinforce_record(record.id)
             except (ValueError, IOError) as exc:
@@ -270,10 +236,22 @@ def capture_transcript(
             except Exception:
                 counts["errors"] += 1
                 continue
-            turn = _extract_transcript_turn(obj)
-            if turn is None:
+            msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+            role = obj.get("type") or msg.get("role", "")
+            if role not in {"user", "assistant"}:
                 continue
-            role, text = turn
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                # Claude Code messages use block format; collect text blocks
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                text = "\n".join(text_parts).strip()
+            else:
+                text = str(content).strip()
+            if not text:
+                continue
             result = capture_turn(
                 store,
                 cue=f"session {session_id} turn {seen}",
@@ -291,8 +269,85 @@ def capture_transcript(
     return counts
 
 
+def _parse_transcript_line(line: str) -> tuple[str, str] | None:
+    """Parse a Claude Code transcript JSONL line into (role, text).
+
+    Returns None if the line is not a user/assistant turn, has empty text,
+    or cannot be JSON-decoded. Used by both `capture_transcript` and the
+    deferred-write paths to keep parsing rules in one place.
+    """
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return None
+    msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+    role = obj.get("type") or msg.get("role", "")
+    if role not in {"user", "assistant"}:
+        return None
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        text = "\n".join(parts).strip()
+    else:
+        text = str(content).strip()
+    if not text:
+        return None
+    return role, text
+
+
+def write_deferred_event(
+    session_id: str,
+    role: str,
+    text: str,
+    *,
+    cwd: str | None = None,
+) -> Path:
+    """Append a single JSONL event to `{session_id}.live.jsonl`.
+
+    Creates the file with a header on first call; appends events on
+    subsequent calls. Pure file IO — no daemon socket, no embedder,
+    no shield, no LanceDB.
+
+    The drain function skips files matching the exact `*.live.jsonl`
+    suffix, so the writer/drain race is structurally impossible while
+    this file is the active marker. The Stop hook renames the file to
+    `{session_id}.live-{epoch}.jsonl` at session end; the drain then
+    picks it up.
+
+    Format invariants are duplicated by the per-turn shell hook at
+    deploy/hooks/iai-mcp-turn-capture.sh (system-python inline) — keep
+    header/event keys in sync.
+    """
+    deferred_dir = Path.home() / ".iai-mcp" / ".deferred-captures"
+    deferred_dir.mkdir(parents=True, exist_ok=True)
+    path = deferred_dir / f"{session_id}.live.jsonl"
+    need_header = (not path.exists()) or path.stat().st_size == 0
+    with path.open("a") as fh:
+        if need_header:
+            header = {
+                "version": 1,
+                "deferred_at": datetime.now(timezone.utc).isoformat(),
+                "session_id": session_id,
+                "cwd": cwd or os.getcwd(),
+            }
+            fh.write(json.dumps(header, ensure_ascii=False) + "\n")
+        event = {
+            "text": text,
+            "cue": f"session {session_id} turn",
+            "tier": "episodic",
+            "role": role,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+    return path
+
+
 # ---------------------------------------------------------------------------
-# R3 / D7.1-04: deferred-captures writer for `--no-spawn` hook mode
+# Deferred-captures writer for `--no-spawn` hook mode
 # ---------------------------------------------------------------------------
 
 
@@ -306,13 +361,12 @@ def write_deferred_captures(
     """Defer transcript capture by writing events to a JSONL file under
     ``~/.iai-mcp/.deferred-captures/``. Returns the path written.
 
-    Used by ``iai-mcp capture-transcript --no-spawn`` (R3, D7.1-04) when the
-    daemon is unreachable. The Stop hook calls this so it never blocks
-    session teardown waiting for a daemon spawn (the third spawn vector
-    forensic anomaly #3 from ``report-20260426-150300.md``).
+    Used by ``iai-mcp capture-transcript --no-spawn`` when the daemon is
+    unreachable. The Stop hook calls this so it never blocks session teardown
+    waiting for a daemon spawn.
 
-    The daemon's drain loop (Plan 07.1-05b, in daemon.py / WAKE handler)
-    consumes these on next WAKE. Format is JSONL v1 per D7.1-04:
+    The daemon's drain loop (in daemon.py / WAKE handler) consumes these on
+    next WAKE. Format is JSONL v1:
 
     - Line 1: header ``{"version":1,"deferred_at":<ISO>,"session_id":<id>,"cwd":<path>}``
     - Lines 2..N: one event per user/assistant turn
@@ -341,13 +395,14 @@ def write_deferred_captures(
           deferred path and the inline path stay consistent.
         - Returns even on missing transcript (writes header only) — daemon
           drain treats as no-op. Hook MUST never raise here.
-        - Stdlib only: ``json``, ``time``, ``pathlib.Path``, ``datetime``, ``os``.
+        - Stdlib only: ``json``, ``time``, ``pathlib.Path``, ``datetime``,
+          ``os``.
     """
     deferred_dir = Path.home() / ".iai-mcp" / ".deferred-captures"
     deferred_dir.mkdir(parents=True, exist_ok=True)
     out_path = deferred_dir / f"{session_id}-{int(time.time())}.jsonl"
     with out_path.open("w") as fh:
-        # Header (line 1, version=1 forward-compat marker per D7.1-04).
+        # Header (line 1, version=1 forward-compat marker).
         header = {
             "version": 1,
             "deferred_at": datetime.now(timezone.utc).isoformat(),
@@ -369,10 +424,22 @@ def write_deferred_captures(
                     obj = json.loads(line)
                 except Exception:
                     continue
-                turn = _extract_transcript_turn(obj)
-                if turn is None:
+                msg = obj.get("message") if isinstance(obj.get("message"), dict) else obj
+                role = obj.get("type") or msg.get("role", "")
+                if role not in {"user", "assistant"}:
                     continue
-                role, text = turn
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    text_parts = [
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    text = "\n".join(text_parts).strip()
+                else:
+                    text = str(content).strip()
+                if not text:
+                    continue
                 event = {
                     "text": text,
                     "cue": f"session {session_id} turn {seen}",
@@ -385,13 +452,13 @@ def write_deferred_captures(
 
 
 # ---------------------------------------------------------------------------
-# R3 / D7.1-04: deferred-captures drain (READ side, daemon-resident)
+# Deferred-captures drain (READ side, daemon-resident)
 # ---------------------------------------------------------------------------
 
 
 def drain_deferred_captures(store: MemoryStore) -> dict[str, int]:
     """Consume ``~/.iai-mcp/.deferred-captures/*.jsonl`` produced by
-    ``iai-mcp capture-transcript --no-spawn`` (Plan 07.1-05 WRITE side).
+    ``iai-mcp capture-transcript --no-spawn``.
 
     For each ``.jsonl`` file in the deferred-captures dir:
 
@@ -400,7 +467,7 @@ def drain_deferred_captures(store: MemoryStore) -> dict[str, int]:
       leave the file in place — a future daemon version will know how to
       handle it.
     * For each event line (lines 2..N), call ``capture_turn(store, ...)``
-      and inspect its return-status dict. W2 / D-02:
+      and inspect its return-status dict:
       - status="inserted"  → events_inserted += 1
       - status="reinforced" → events_reinforced += 1
       - status="skipped" with reason matching ^insert-failed:* (capture_turn
@@ -456,7 +523,27 @@ def drain_deferred_captures(store: MemoryStore) -> dict[str, int]:
     }
     if not deferred_dir.exists():
         return counts
-    for fpath in sorted(deferred_dir.glob("*.jsonl")):
+    total_events_processed = 0
+    cap_hit = False
+    # Iterate every .jsonl entry but skip exact active-writer markers and
+    # *.failed-*.jsonl files (preserved evidence from prior drains).
+    candidates = []
+    for fpath in sorted(deferred_dir.iterdir()):
+        if fpath.suffix != ".jsonl":
+            continue
+        if _LIVE_ACTIVE_RE.search(fpath.name):
+            continue
+        # Skip the `.failed-<ts>.jsonl` evidence files — they are NOT
+        # supposed to be reprocessed. The existing convention names them
+        # via with_suffix(".failed-<ts>.jsonl") which leaves a `.failed-N`
+        # marker in the basename followed by `.jsonl`.
+        if ".failed-" in fpath.name:
+            continue
+        candidates.append(fpath)
+
+    for fpath in candidates:
+        if cap_hit:
+            break
         file_had_insert_failure = False
         file_first_error: str | None = None
         try:
@@ -478,7 +565,26 @@ def drain_deferred_captures(store: MemoryStore) -> dict[str, int]:
                 continue
             session_id = header.get("session_id", "-")
             event_lines = lines[1:]
-            for ln in event_lines:
+            processed_in_file = 0
+            for idx, ln in enumerate(event_lines):
+                if total_events_processed >= MAX_DRAIN_EVENTS_PER_RUN:
+                    # Cap reached mid-file — write the unprocessed remainder
+                    # to {basename}.partial.jsonl atomically and unlink the
+                    # original only after the partial is durable on disk.
+                    remainder = event_lines[idx:]
+                    partial_path = fpath.with_suffix(".partial.jsonl")
+                    tmp_path = fpath.with_suffix(".partial.tmp")
+                    with tmp_path.open("w") as ph:
+                        ph.write(lines[0] + "\n")
+                        for r in remainder:
+                            ph.write(r + "\n")
+                        ph.flush()
+                        os.fsync(ph.fileno())
+                    os.replace(tmp_path, partial_path)
+                    fpath.unlink()
+                    counts["files_drained"] += 1
+                    cap_hit = True
+                    break
                 ev = json.loads(ln)
                 # Reuse capture_turn so the deferred path lands in the same
                 # shield + dedup + encryption pipeline as live captures.
@@ -503,12 +609,15 @@ def drain_deferred_captures(store: MemoryStore) -> dict[str, int]:
                         file_first_error = reason
                 else:
                     counts["events_skipped_intentional"] += 1
+                total_events_processed += 1
+                processed_in_file += 1
+            if cap_hit:
+                break
             if file_had_insert_failure:
-                # preserve the file as evidence — at least one
-                # event hit the insert-failed code path inside capture_turn
-                # (store.insert raised, capture_turn swallowed and returned
-                # status=skipped reason=insert-failed:*). Pre-07.9 the file
-                # was unlinked here and the data was silently lost.
+                # Preserve the file as evidence — at least one event hit
+                # the insert-failed code path inside capture_turn (store.insert
+                # raised, capture_turn swallowed and returned status=skipped
+                # reason=insert-failed:*).
                 failed_path = fpath.with_suffix(f".failed-{int(time.time())}.jsonl")
                 fpath.rename(failed_path)
                 with log_path.open("a") as logf:
