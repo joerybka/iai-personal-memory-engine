@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] — 2026-05-14
+
+### Added
+
+- **Update-check SessionStart hook** (`deploy/hooks/iai-mcp-update-check.sh`): on new session startup, compares the installed version against the latest GitHub release. Prints one line when an update is available; silent otherwise. Result cached for 6 hours; fetch runs in a detached background subshell so session startup is never blocked.
+- `capture-hooks install` now registers the update-check hook alongside capture and recall hooks. `capture-hooks uninstall` and `capture-hooks status` handle it symmetrically.
+
 ## [0.4.1] — 2026-05-14
 
 ### Fixed
@@ -102,6 +109,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial public release. Local memory daemon for MCP-over-stdio hosts. Verbatim recall, ambient capture, sleep-cycle consolidation, encrypted-at-rest LanceDB store, configurable operating profile.
 
+[0.4.2]: https://github.com/CodeAbra/iai-mcp/releases/tag/v0.4.2
 [0.4.1]: https://github.com/CodeAbra/iai-mcp/releases/tag/v0.4.1
 [0.4.0]: https://github.com/CodeAbra/iai-mcp/releases/tag/v0.4.0
 [0.3.2]: https://github.com/CodeAbra/iai-mcp/releases/tag/v0.3.2

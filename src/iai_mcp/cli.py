@@ -1011,6 +1011,7 @@ def _patch_claude_desktop_config(action: str) -> str:
 _CAPTURE_HOOK_MARKER = "iai-mcp-session-capture.sh"
 _TURN_HOOK_MARKER = "iai-mcp-turn-capture.sh"
 _SESSION_RECALL_HOOK_MARKER = "iai-mcp-session-recall.sh"
+_UPDATE_CHECK_HOOK_MARKER = "iai-mcp-update-check.sh"
 
 
 def _session_recall_hook_paths() -> tuple[Path, Path, Path]:
@@ -1024,6 +1025,17 @@ def _session_recall_hook_paths() -> tuple[Path, Path, Path]:
     dst = _P.home() / ".claude" / "hooks" / "iai-mcp-session-recall.sh"
     settings = _P.home() / ".claude" / "settings.json"
     return src, dst, settings
+
+
+def _update_check_hook_paths() -> tuple[Path, Path]:
+    """Return (hook_src_in_repo, hook_dst_in_home) for the update-check hook."""
+    from pathlib import Path as _P
+    import iai_mcp
+    pkg_dir = _P(iai_mcp.__file__).resolve().parent
+    repo_root = pkg_dir.parent.parent
+    src = repo_root / "deploy" / "hooks" / "iai-mcp-update-check.sh"
+    dst = _P.home() / ".claude" / "hooks" / "iai-mcp-update-check.sh"
+    return src, dst
 
 
 def _load_settings(path):
@@ -1118,6 +1130,31 @@ def cmd_capture_hooks_install(args: argparse.Namespace) -> int:
     else:
         print(f"WARN: recall hook template missing in repo: {src_recall}")
 
+    update_src, update_dst = _update_check_hook_paths()
+    if update_src.exists():
+        update_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(update_src, update_dst)
+        update_dst.chmod(update_dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
+        print(f"installed: {update_dst}")
+
+        ss_list = data["hooks"].setdefault("SessionStart", [])
+        update_cmd = f"bash {update_dst}"
+        already_update = any(
+            any(_UPDATE_CHECK_HOOK_MARKER in (h.get("command") or "")
+                for h in (entry.get("hooks") or []))
+            for entry in ss_list
+        )
+        if already_update:
+            print("settings.json already has update-check hook — no change")
+        else:
+            ss_list.append({
+                "matcher": "startup",
+                "hooks": [{"type": "command", "command": update_cmd, "timeout": 5}],
+            })
+            print(f"patched: {settings} (SessionStart update-check registered)")
+    else:
+        print(f"WARN: update-check hook template missing in repo: {update_src}")
+
     settings.write_text(_json.dumps(data, indent=2))
 
     # Claude Desktop is a separate app with its own mcpServers config —
@@ -1132,31 +1169,20 @@ def cmd_capture_hooks_install(args: argparse.Namespace) -> int:
 
 
 def cmd_capture_hooks_uninstall(args: argparse.Namespace) -> int:
-    """Remove all three hook scripts and their settings.json entries
-    (idempotent)."""
+    """Remove hook scripts and their settings.json entries (idempotent)."""
     import json as _json
 
     _, dst, settings = _capture_hook_paths()
     _, turn_dst = _turn_hook_paths()
     _, dst_recall, _ = _session_recall_hook_paths()
+    _, update_dst = _update_check_hook_paths()
 
-    if dst.exists():
-        dst.unlink()
-        print(f"removed: {dst}")
-    else:
-        print(f"(not present) {dst}")
-
-    if turn_dst.exists():
-        turn_dst.unlink()
-        print(f"removed: {turn_dst}")
-    else:
-        print(f"(not present) {turn_dst}")
-
-    if dst_recall.exists():
-        dst_recall.unlink()
-        print(f"removed: {dst_recall}")
-    else:
-        print(f"(not present) {dst_recall}")
+    for path in (dst, turn_dst, dst_recall, update_dst):
+        if path.exists():
+            path.unlink()
+            print(f"removed: {path}")
+        else:
+            print(f"(not present) {path}")
 
     if settings.exists():
         data = _load_settings(settings)
@@ -1185,10 +1211,13 @@ def cmd_capture_hooks_uninstall(args: argparse.Namespace) -> int:
 
         data = _load_settings(settings)
         ss_list = data.get("hooks", {}).get("SessionStart", [])
+        ss_markers = (_SESSION_RECALL_HOOK_MARKER, _UPDATE_CHECK_HOOK_MARKER)
         kept_ss = [
             entry for entry in ss_list
-            if not any(_SESSION_RECALL_HOOK_MARKER in (h.get("command") or "")
-                       for h in (entry.get("hooks") or []))
+            if not any(
+                any(m in (h.get("command") or "") for m in ss_markers)
+                for h in (entry.get("hooks") or [])
+            )
         ]
         if len(kept_ss) != len(ss_list):
             if kept_ss:
@@ -1196,7 +1225,7 @@ def cmd_capture_hooks_uninstall(args: argparse.Namespace) -> int:
             else:
                 data["hooks"].pop("SessionStart", None)
             settings.write_text(_json.dumps(data, indent=2))
-            print(f"patched: {settings} (SessionStart entry removed)")
+            print(f"patched: {settings} (SessionStart entries removed)")
         else:
             print(f"(no SessionStart entry to remove) {settings}")
 
@@ -1208,12 +1237,12 @@ def cmd_capture_hooks_uninstall(args: argparse.Namespace) -> int:
 
 
 def cmd_capture_hooks_status(args: argparse.Namespace) -> int:
-    """Show whether all three hooks (Stop / UserPromptSubmit / SessionStart)
-    are installed and active on both surfaces."""
+    """Show whether hooks are installed and active on both surfaces."""
     import json as _json
     src, dst, settings = _capture_hook_paths()
     turn_src, turn_dst = _turn_hook_paths()
     src_recall, dst_recall, _ = _session_recall_hook_paths()
+    update_src, update_dst = _update_check_hook_paths()
 
     print(f"Stop template:        {src}  {'PRESENT' if src.exists() else 'MISSING'}")
     print(f"Stop installed:       {dst}  {'PRESENT' if dst.exists() else 'MISSING'}")
@@ -1221,6 +1250,8 @@ def cmd_capture_hooks_status(args: argparse.Namespace) -> int:
     print(f"Turn installed:       {turn_dst}  {'PRESENT' if turn_dst.exists() else 'MISSING'}")
     print(f"Recall template:      {src_recall}  {'PRESENT' if src_recall.exists() else 'MISSING'}")
     print(f"Recall installed:     {dst_recall}  {'PRESENT' if dst_recall.exists() else 'MISSING'}")
+    print(f"Update template:      {update_src}  {'PRESENT' if update_src.exists() else 'MISSING'}")
+    print(f"Update installed:     {update_dst}  {'PRESENT' if update_dst.exists() else 'MISSING'}")
 
     data = _load_settings(settings)
     stop_list = data.get("hooks", {}).get("Stop", [])
@@ -1241,9 +1272,15 @@ def cmd_capture_hooks_status(args: argparse.Namespace) -> int:
             for h in (entry.get("hooks") or []))
         for entry in ss_list
     )
+    update_wired = any(
+        any(_UPDATE_CHECK_HOOK_MARKER in (h.get("command") or "")
+            for h in (entry.get("hooks") or []))
+        for entry in ss_list
+    )
     print(f"Claude Code settings.json Stop:             {settings}  {'WIRED' if wired else 'NOT WIRED'}")
     print(f"Claude Code settings.json UserPromptSubmit: {settings}  {'WIRED' if turn_wired else 'NOT WIRED'}")
     print(f"Claude Code settings.json SessionStart:     {settings}  {'WIRED' if recall_wired else 'NOT WIRED'}")
+    print(f"Claude Code settings.json Update-check:     {settings}  {'WIRED' if update_wired else 'NOT WIRED'}")
 
     # Claude Desktop (separate config file, separate app).
     desktop_cfg = _claude_desktop_config_path()
