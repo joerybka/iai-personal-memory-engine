@@ -14,9 +14,9 @@ Production code already does the substitution.
 calls `text.replace("/usr/local/bin/python3", sys.executable)`, and
 `_render_systemd_unit` calls
 `text.replace("/usr/bin/python3", sys.executable)`. The plist template
-at `deploy/launchd/com.iai-mcp.daemon.plist` carries
+at `src/iai_mcp/_deploy/launchd/com.iai-mcp.daemon.plist` carries
 `<string>/usr/local/bin/python3</string>` inside `ProgramArguments`, and
-`deploy/systemd/iai-mcp-daemon.service` carries
+`src/iai_mcp/_deploy/systemd/iai-mcp-daemon.service` carries
 `ExecStart=/usr/bin/python3 -m iai_mcp.daemon`. Production-code change
 for this plan is ZERO LINES; this file is a regression lock so a future
 refactor that hardcodes the path will fail these tests.

@@ -32,7 +32,7 @@ from iai_mcp import cli as cli_mod
 
 
 # The watchdog env keys the re-rendered plist + a fresh install MUST carry.
-# Values match the shipped template (deploy/launchd/com.iai-mcp.daemon.plist)
+# Values match the shipped template (src/iai_mcp/_deploy/launchd/com.iai-mcp.daemon.plist)
 # AND the daemon code defaults (daemon.py WATCHDOG_* loaders), so the rendered
 # plist deploys the exact same behaviour the daemon already runs with.
 EXPECTED_WATCHDOG_ENV: dict[str, str] = {

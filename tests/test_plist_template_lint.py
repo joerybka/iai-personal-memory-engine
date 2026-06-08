@@ -15,7 +15,7 @@ These tests guard the *template itself*:
     required field (Sockets, RunAtLoad, SockPathMode=384, KeepAlive,
     IAI_MCP_LAUNCHD_MANAGED).
   * ``test_template_does_not_have_RunAtLoad_true`` — regression trap: the
-    legacy ``deploy/launchd/com.iai-mcp.daemon.plist`` uses
+    legacy bundled plist used
     ``<key>RunAtLoad</key><true/>`` which defeats socket activation; we
     must NOT reintroduce that pattern in the new template.
 
@@ -79,9 +79,9 @@ def test_template_has_required_keys() -> None:
 
 
 def test_template_does_not_have_RunAtLoad_true() -> None:
-    """Regression trap: legacy deploy/launchd plist's <true/> bug must NOT appear.
+    """Regression trap: the legacy plist's <true/> bug must NOT appear.
 
-    The legacy ``deploy/launchd/com.iai-mcp.daemon.plist`` uses
+    A legacy bundled plist used
     ``<key>RunAtLoad</key><true/>`` which defeats socket activation
     (eager spawn at user login = no listener pre-bind). The
     template MUST use ``<false/>`` so launchd defers spawn until the
