@@ -6,7 +6,7 @@
 <p align="center">Every claim ships with the harness that proves it. Run the benchmarks yourself.</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/release-v1.0.0-1f6feb?style=flat-square" alt="Release v1.0.0">
+  <img src="https://img.shields.io/github/v/release/CodeAbra/iai-personal-memory-engine?style=flat-square&color=1f6feb" alt="Latest release">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-1f6feb?style=flat-square" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/python-3.11%20|%203.12-3776ab?style=flat-square&logo=python&logoColor=white" alt="Python 3.11 | 3.12">
   <img src="https://img.shields.io/badge/platform-macOS-555?style=flat-square&logo=apple&logoColor=white" alt="Platform: macOS">
@@ -347,7 +347,7 @@ The old `IAI_MCP_EMBED_MODEL` knob is gone — the embedder is a single built-in
 
 ## Doctor
 
-`iai-mcp doctor` runs 23 checks against the local engine, the store, the native engine, and the runtime state. Output is one line per check: PASS, WARN, or FAIL.
+`iai-mcp doctor` runs 25 checks against the local engine, the store, the native engine, and the runtime state. Output is one line per check: PASS, WARN, or FAIL.
 
 <p align="center"><img src="docs/assets/slides/slide-13.jpg" width="850" alt="iai-pme"></p>
 
