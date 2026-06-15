@@ -5,7 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] — 2026-06-12
+## [1.1.0] — 2026-06-14
+
+### Added
+
+- **Experimental Linux support.** The native engine now builds on Linux (the
+  Rust extension no longer hard-depends on a macOS-only acceleration backend),
+  the daemon installs as a systemd user service, and the capture/recall hooks
+  run on POSIX shells. `scripts/install.sh` handles the Linux path and the
+  README documents the extra build prerequisites. Validated on macOS; Linux is
+  code-complete but not yet validated end-to-end — testing and port feedback
+  are welcome.
 
 ### Changed
 
