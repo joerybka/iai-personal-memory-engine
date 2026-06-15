@@ -1,6 +1,6 @@
 [project]
 name = "iai-mcp"
-version = "1.1.0"
+version = "1.1.1"
 description = "MCP server giving Claude persistent autistic-style memory + learning"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -89,4 +89,6 @@ markers = [
   "slow: opt-in via --runslow (subprocess-heavy bench-shim resolution tests)",
   "perf: opt-in via --perf (wall-clock latency benches, out of the default correctness gate)",
   "live: opt-in via --live (real daemon-subprocess E2E gate, out of the default correctness gate)",
+  "literature: algorithm-baseline parity checks",
 ]
+norecursedirs = ["_manual", ".*", "build", "dist", "node_modules", "*.egg"]

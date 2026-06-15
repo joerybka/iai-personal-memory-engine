@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] — 2026-06-15
+
+### Fixed
+
+- Linux runtime fixes for the experimental Linux path: daemon binder detection
+  gains an `ss` fallback, ANN query distances are clamped to a valid range, and
+  the multiprocess store path no longer races on table visibility. Linux remains
+  experimental and unvalidated end-to-end — testing and port feedback are welcome.
+
+### Changed
+
+- Internal cleanup only — no changes to the public API, the `iai-mcp` / `iai`
+  CLI, the MCP tool set, or the on-disk store format: the sleep-pipeline
+  compatibility shim was removed in favour of the canonical module, sleep-step
+  names were made consistent, and more wall-clock benches are gated out of the
+  default test run.
+
 ## [1.1.0] — 2026-06-14
 
 ### Added
