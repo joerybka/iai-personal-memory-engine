@@ -73,6 +73,7 @@ def test_flush_empty_buffer_returns_zero(tmp_path):
     assert count == 0
 
 
+@pytest.mark.perf
 def test_bench_d_speed_still_green(tmp_path):
     from bench.neural_map import run_neural_map_bench, D_SPEED_P95_MS
 

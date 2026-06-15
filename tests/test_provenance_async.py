@@ -84,6 +84,7 @@ def test_atexit_flush(tmp_path, monkeypatch):
     assert len(got.provenance) == 1
     q.stop()
 
+@pytest.mark.perf
 def test_pipeline_recall_does_not_block_on_merge_insert(tmp_path, monkeypatch):
     from iai_mcp.core import dispatch
 

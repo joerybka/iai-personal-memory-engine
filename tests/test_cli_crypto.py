@@ -210,6 +210,7 @@ def test_cli_migrate_to_3_rejects_unsupported_version_pair(
             "unsupported" in out or "invalid" in out)
 
 
+@pytest.mark.perf
 def test_neural_map_bench_passes_after_encryption(tmp_path):
     from bench.neural_map import run_neural_map_bench, D_SPEED_P95_MS
 

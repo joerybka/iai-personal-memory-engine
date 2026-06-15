@@ -105,6 +105,7 @@ def test_per_store_isolation(tmp_path):
     assert result_b_cached is result_b
 
 
+@pytest.mark.perf
 def test_d_speed_bench_green(tmp_path):
     from bench.neural_map import run_neural_map_bench, D_SPEED_P95_MS
 
