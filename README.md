@@ -6,7 +6,7 @@
 <p align="center">Every claim ships with the harness that proves it. Run the benchmarks yourself.</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/release-v1.0.3-1f6feb?style=flat-square" alt="Release v1.0.3">
+  <img src="https://img.shields.io/badge/release-v1.1.2-1f6feb?style=flat-square" alt="Release v1.1.2">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-1f6feb?style=flat-square" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/python-3.11%20|%203.12-3776ab?style=flat-square&logo=python&logoColor=white" alt="Python 3.11 | 3.12">
   <img src="https://img.shields.io/badge/platform-macOS-555?style=flat-square&logo=apple&logoColor=white" alt="Platform: macOS">
@@ -318,7 +318,7 @@ On raw retrieval — the headline both projects ship — it's an **exact tie** o
 | Memory (RSS) | 589 MB @10k records | Embedder + graph runtime; well under the 2 GB budget. |
 | Rust embedder | p50 70 ms / p95 253 ms | bge-small-en-v1.5, 384-dim. |
 
-**One honest gap:** retrieving the *superseded* wording of an updated fact verbatim regressed (0.90 → 0.71) in this release — separate from Rescue@10 (current-fact retrieval, still 1.000) — and is a tracked fix for the next release.
+**One honest gap:** retrieving the *superseded* wording of an updated fact verbatim regressed (0.90 → 0.71) in an earlier release — separate from Rescue@10 (current-fact retrieval, still 1.000) — and is a tracked fix for the next release.
 
 ```bash
 python -m bench.longmemeval_blind            # LongMemEval-S (raw)
@@ -381,6 +381,8 @@ What it checks:
 | t | hippo_compacted freshness | Compaction has run recently |
 | u | recall centrality regression | Recall ranking hasn't regressed |
 | v | native Rust embedder | The Rust embedder is built and produces vectors |
+| w | no permanent-failed captures | No capture is stuck after exhausting its retries |
+| x | timestamps not collapsed | Record timestamps span a real range, not all-identical |
 | z | AVX2 CPU support | CPU supports the instructions the native libs need |
 
 A full-PASS run is healthy. Dropping (b) during a sleep cycle is normal (the socket is busy during consolidation). Multiple FAILs, or a FAIL on (a)/(f)/(v), means something is actually wrong.
@@ -424,7 +426,7 @@ When in doubt, run `iai-mcp doctor` and read what it says. The output is self-ex
 
 ## Status and limitations
 
-**v1.0.0 — out of experimental.** I built this for myself and ran it daily for months; it's now a stable release with a committed public surface. The MCP tool set and the on-disk store stay stable across `1.x` — breaking changes go through the changelog with a deprecation window. It's still a solo-maintained project with no enterprise SLA, but it's no longer a moving target.
+**Out of experimental.** I built this for myself and ran it daily for months; it's now a stable release with a committed public surface. The MCP tool set and the on-disk store stay stable across `1.x` — breaking changes go through the changelog with a deprecation window. It's still a solo-maintained project with no enterprise SLA, but it's no longer a moving target.
 
 Limitations worth knowing about:
 
