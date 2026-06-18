@@ -566,3 +566,172 @@ def test_migrate_rederive_writes_event(tmp_path):
     events = query_events(store, kind="migration_rederive_timestamps")
     assert len(events) >= 1
     assert "records_updated" in events[0]["data"]
+
+
+# ---------------------------------------------------------------------------
+# Episodic capture de-duplication tests
+# ---------------------------------------------------------------------------
+
+
+def _make_episodic_record_with_idem_tag(
+    text: str,
+    session_id: str,
+    idem_tag: str,
+    created_at: datetime,
+) -> MemoryRecord:
+    """Build an episodic MemoryRecord carrying a fixed idem-tag, simulating
+    what capture_turn() produces for two captures of the same logical turn."""
+    return MemoryRecord(
+        id=uuid4(),
+        tier="episodic",
+        literal_surface=text,
+        aaak_index="",
+        embedding=[0.1] * EMBED_DIM,
+        community_id=None,
+        centrality=0.0,
+        detail_level=2,
+        pinned=False,
+        stability=0.0,
+        difficulty=0.0,
+        last_reviewed=None,
+        never_decay=False,
+        never_merge=False,
+        provenance=[{"session_id": session_id, "role": "user"}],
+        created_at=created_at,
+        updated_at=created_at,
+        tags=["capture", "role:user", idem_tag],
+        language="en",
+        schema_version=5,
+    )
+
+
+def _tombstoned_at(store, record_id) -> str | None:
+    with store.db._conn_lock:
+        row = store.db._conn.execute(
+            "SELECT tombstoned_at FROM records WHERE id = ?", (str(record_id),)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def test_migrate_dedupe_episodic_captures_tombstones_extras(tmp_path):
+    """Records sharing an idem-tag are reduced to one survivor; extras are
+    tombstoned (soft-deleted), never hard-deleted."""
+    from iai_mcp.migrate import migrate_dedupe_episodic_captures
+    from iai_mcp.store import MemoryStore
+
+    store = MemoryStore(path=tmp_path)
+    session_id = "sess-dedupe"
+    same_ts = datetime(2026, 6, 16, 12, 30, 21, tzinfo=timezone.utc)
+    idem_tag = "idem:" + "a" * 64
+
+    dup_records = [
+        _make_episodic_record_with_idem_tag(
+            "/ide-index-mcp turn, raced by concurrent drains", session_id, idem_tag, same_ts
+        )
+        for _ in range(3)
+    ]
+    for r in dup_records:
+        store.insert(r)
+
+    # An unrelated record must be left alone.
+    unrelated = _make_episodic_record_with_idem_tag(
+        "unrelated turn", session_id, "idem:" + "b" * 64, same_ts
+    )
+    store.insert(unrelated)
+
+    result = migrate_dedupe_episodic_captures(store)
+    assert result["groups"] == 1
+    assert result["tombstoned"] == 2
+    assert result["dry_run"] is False
+
+    tombstoned_count = sum(
+        1 for r in dup_records if _tombstoned_at(store, r.id) is not None
+    )
+    assert tombstoned_count == 2
+
+    survivors = [r for r in dup_records if _tombstoned_at(store, r.id) is None]
+    assert len(survivors) == 1
+
+    # Untouched: unrelated record, and every duplicate's actual content.
+    assert _tombstoned_at(store, unrelated.id) is None
+    for r in dup_records:
+        fetched = store.get(r.id)
+        assert fetched.literal_surface == r.literal_surface
+
+
+def test_migrate_dedupe_episodic_captures_idempotent(tmp_path):
+    """Running the dedupe migration twice tombstones zero records the second time."""
+    from iai_mcp.migrate import migrate_dedupe_episodic_captures
+    from iai_mcp.store import MemoryStore
+
+    store = MemoryStore(path=tmp_path)
+    session_id = "sess-dedupe-idem"
+    same_ts = datetime(2026, 6, 16, 12, 30, 21, tzinfo=timezone.utc)
+    idem_tag = "idem:" + "c" * 64
+
+    for _ in range(4):
+        store.insert(
+            _make_episodic_record_with_idem_tag(
+                "repeated turn", session_id, idem_tag, same_ts
+            )
+        )
+
+    first = migrate_dedupe_episodic_captures(store)
+    assert first["tombstoned"] == 3
+
+    second = migrate_dedupe_episodic_captures(store)
+    assert second["tombstoned"] == 0
+    assert second["groups"] == 0
+
+
+def test_migrate_dedupe_episodic_captures_dry_run(tmp_path):
+    """dry_run=True reports what would happen but tombstones nothing."""
+    from iai_mcp.migrate import migrate_dedupe_episodic_captures
+    from iai_mcp.store import MemoryStore
+
+    store = MemoryStore(path=tmp_path)
+    session_id = "sess-dedupe-dry"
+    same_ts = datetime(2026, 6, 16, 12, 30, 21, tzinfo=timezone.utc)
+    idem_tag = "idem:" + "d" * 64
+
+    records = [
+        _make_episodic_record_with_idem_tag(
+            "dry run turn", session_id, idem_tag, same_ts
+        )
+        for _ in range(3)
+    ]
+    for r in records:
+        store.insert(r)
+
+    result = migrate_dedupe_episodic_captures(store, dry_run=True)
+    assert result["dry_run"] is True
+    assert result["groups"] == 1
+    assert result["tombstoned"] == 2
+
+    for r in records:
+        assert _tombstoned_at(store, r.id) is None
+
+
+def test_migrate_dedupe_episodic_captures_writes_event(tmp_path):
+    """A migration_dedupe_episodic_captures event is written after a non-dry run."""
+    from iai_mcp.events import query_events
+    from iai_mcp.migrate import migrate_dedupe_episodic_captures
+    from iai_mcp.store import MemoryStore
+
+    store = MemoryStore(path=tmp_path)
+    session_id = "sess-dedupe-event"
+    same_ts = datetime(2026, 6, 16, 12, 30, 21, tzinfo=timezone.utc)
+    idem_tag = "idem:" + "e" * 64
+
+    for _ in range(2):
+        store.insert(
+            _make_episodic_record_with_idem_tag(
+                "event turn", session_id, idem_tag, same_ts
+            )
+        )
+
+    migrate_dedupe_episodic_captures(store)
+
+    events = query_events(store, kind="migration_dedupe_episodic_captures")
+    assert len(events) >= 1
+    assert "tombstoned" in events[0]["data"]
