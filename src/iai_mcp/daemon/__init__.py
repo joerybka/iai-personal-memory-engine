@@ -1282,8 +1282,13 @@ async def main() -> int:
                     _prev_lifecycle_state[0] = current
                     if current is _LifecycleState.SLEEP:
                         def _interrupt_check() -> bool:
-                            if mcp_socket.active_connections > 0:
-                                return True
+                            # Defer the sleep pipeline only on RECENT ACTIVITY, not on
+                            # open connections: long-lived Claude sessions keep sockets
+                            # open permanently, so `active_connections > 0` was True at
+                            # nearly every tick -> the cycle never completed -> no
+                            # HIBERNATION -> the wake-hook re-ran every 30s (the 221% CPU
+                            # churn). last_activity_ts is refreshed on each request, so a
+                            # busy burst still defers; a 30s lull lets the cycle finish.
                             elapsed = (
                                 time.monotonic() - mcp_socket.last_activity_ts
                             )
