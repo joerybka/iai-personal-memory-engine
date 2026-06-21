@@ -844,6 +844,10 @@ def _recall_core(
             MemoryHit(
                 record_id=cid,
                 score=float(s),
+                # Keep the raw, unclamped score as the internal ranking key so
+                # post-rank re-sorts preserve engine order even when the
+                # displayed score is later clamped to [0,1] at serialization.
+                sort_score=float(s),
                 reason=reason,
                 literal_surface=rec.literal_surface,
                 adjacent_suggestions=suggestions,
@@ -1140,7 +1144,13 @@ def recall_for_response(
     )
     apply_stale_downweight(core.scored_hits, cue_intent=_cue_intent)
     apply_stale_downweight(core.anti_hits, cue_intent=_cue_intent)
-    core.scored_hits.sort(key=lambda h: h.score, reverse=True)
+    # Rank on the internal unclamped key (falls back to score when a hit was
+    # built without sort_score), so ordering is preserved across the display
+    # clamp applied at serialization.
+    core.scored_hits.sort(
+        key=lambda h: (h.sort_score if h.sort_score is not None else h.score),
+        reverse=True,
+    )
 
     if (
         len(core.scored_hits) == 1

@@ -127,7 +127,12 @@ def recall(
     derive_temporal_validity(store, anti_hits)
     apply_stale_downweight(hits)
     apply_stale_downweight(anti_hits)
-    hits.sort(key=lambda h: h.score, reverse=True)
+    # Rank on the internal unclamped key (falls back to score), so ordering
+    # survives the display clamp applied at serialization.
+    hits.sort(
+        key=lambda h: (h.sort_score if h.sort_score is not None else h.score),
+        reverse=True,
+    )
 
     try:
         from iai_mcp.s4 import on_read_check
@@ -384,6 +389,10 @@ def apply_stale_downweight(
             continue
         if not getattr(hit, "_stale_downweighted", False):
             hit.score *= STALE_DOWNWEIGHT_FACTOR
+            # Keep the internal ranking key in lock-step with the displayed
+            # score so stale hits demote in the actual ordering too.
+            if getattr(hit, "sort_score", None) is not None:
+                hit.sort_score *= STALE_DOWNWEIGHT_FACTOR
             hit._stale_downweighted = True
         if not hit.reason.endswith(_STALE_REASON_SUFFIX):
             hit.reason = f"{hit.reason}{_STALE_REASON_SUFFIX}"
