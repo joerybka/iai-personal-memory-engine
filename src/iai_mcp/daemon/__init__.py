@@ -28,6 +28,7 @@ from iai_mcp.events import (
     DAEMON_SLEEP_CYCLE_STALE,
     DAEMON_WATCHDOG_NEEDS_OPERATOR,
     DAEMON_WEDGE_KILL,
+    emit_best_effort,
     write_event,
 )
 from iai_mcp.identity_audit import continuous_audit
@@ -282,6 +283,20 @@ def _store_is_empty(store: MemoryStore) -> bool:
         # the unknown case as NOT empty so the tick proceeds; a truly empty store
         # just does a little harmless no-op work.
         log.debug("store empty check failed, assuming NOT empty: %s", exc)
+        # e8f3deb fixed the *behavior* (don't park the tick) but left the
+        # condition invisible. A recurring count failure (sqlite left in an error
+        # state by a heavy reader) should surface to the operator, not just
+        # log.debug. emit_best_effort is buffered and never raises, so it is safe
+        # even when the store connection is the thing failing.
+        try:
+            emit_best_effort(
+                store,
+                "store_empty_check_failed",
+                {"error": str(exc), "error_type": type(exc).__name__},
+                severity="warning",
+            )
+        except Exception:  # noqa: BLE001 -- telemetry must never break the tick
+            pass
         return False
 
 
