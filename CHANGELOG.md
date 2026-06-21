@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] — 2026-06-21
+
+### Fixed
+
+- **Ambient capture embedded the cue label instead of the message.** The
+  session-capture path embedded a positional provenance label
+  (`"session <id> turn <n>"`) rather than the message content, so stored
+  vectors collapsed and semantic recall degraded on any store built through the
+  session hook. Capture now embeds the message content; the stored text
+  (`literal_surface`) was never affected. Run
+  `iai-mcp migrate --reembed-from-text` once after upgrading to repair vectors
+  written before this fix. Thanks to @Marsu6996 for the report and fix.
+- **Data loss under parallel transcript imports.** `write_deferred_captures`
+  wrote in place to the final filename, so a concurrent drain could read a
+  half-written file and quarantine it as permanently failed. Writes are now
+  atomic (temp file + `os.replace`). Thanks to @gardinermichael for the report.
+- **Sleep daemon could stall in crisis mode.** Interrupted consolidation steps
+  now record the underlying error instead of a bare deferred marker; recall
+  degrades honestly instead of serving stale schema-dominated results while a
+  cycle is stuck; and crisis mode auto-clears after 72 hours. A watchdog now
+  emits an alert when the sleep cycle stops completing.
+
+### Added
+
+- `iai-mcp migrate --reembed-from-text` — re-embeds existing episodic records
+  from their stored text to repair vectors written before the capture fix above.
+  Idempotent; supports `--dry-run`, `--resume`, `--rollback`, and
+  `--reembed-batch-size`.
+- `iai-mcp migrate --salvage-torn-permanent-failed` — recovers complete records
+  from torn `.permanent-failed-*.jsonl` capture files and quarantines the
+  originals.
+- `iai-mcp deferred-unlock-dead-pids` — releases deferred-capture files left
+  locked by a process that is no longer running. Run while the daemon is
+  stopped.
+
 ## [1.1.2] — 2026-06-17
 
 ### Fixed
