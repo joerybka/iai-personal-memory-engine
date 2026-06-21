@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from itertools import combinations
@@ -31,6 +32,32 @@ TEMPORAL_NEXT_WINDOW = timedelta(minutes=5)
 STALE_DOWNWEIGHT_FACTOR: float = 0.5
 
 _STALE_REASON_SUFFIX: str = " · stale"
+
+
+# --- build_runtime_graph single-flight (WAKE CPU-storm fix) -----------------
+# At daemon WAKE several background subsystems (boot preload, sigma identity
+# audit, foraging weak-bridge detection, hippea cascade warming) each call
+# build_runtime_graph concurrently. On a cache MISS each one independently runs
+# the full O(n^2) community detection (mosaic), GIL-bound, in its own to_thread
+# worker. Three+ of those at once contend for the GIL, starve the asyncio event
+# loop, and the liveness watchdog's socket probe times out -> SIGKILL -> relaunch
+# loop. This single-flight gate collapses the concurrent burst into ONE compute:
+# the first caller (leader) computes and saves the on-disk cache; concurrent
+# callers (followers) wait on its Event and then re-load the freshly-saved cache
+# via the cheap path. No mutable graph object is shared between callers (each
+# rebuilds its own MemoryGraph shell + sync hook), and recall is independent of
+# the community assignment, so a slightly-stale shared result is harmless.
+#
+# Followers RE-CONTEND in a bounded loop rather than recomputing unconditionally:
+# if the leader fails before saving (e.g. detect_communities raises), or the cache
+# key shifts mid-burst, or the leader overruns the wait timeout, the woken
+# followers loop back, and exactly ONE of them becomes the next leader while the
+# rest wait again. That degrades those edge cases to *sequential* single-flight
+# (one compute at a time) instead of an N-way concurrent re-storm.
+_BRG_INFLIGHT_LOCK = threading.Lock()
+_BRG_INFLIGHT: dict[str, threading.Event] = {}
+_BRG_WAIT_TIMEOUT_SEC: float = 120.0
+_BRG_MAX_ATTEMPTS: int = 4
 
 
 def recall(
@@ -450,6 +477,63 @@ def _make_graph_sync_hook(graph):
 
 
 def build_runtime_graph(store: MemoryStore):
+    """Single-flight wrapper around the real graph build.
+
+    On a cache HIT this is cheap and runs directly. On a cache MISS it
+    serialises concurrent callers so the expensive community detection runs
+    exactly once per cache generation: the leader computes + saves the cache,
+    followers wait and then reload it cheaply. See the _BRG_* notes above.
+    """
+    from iai_mcp import runtime_graph_cache as _rgc
+
+    cached = None
+    for _attempt in range(_BRG_MAX_ATTEMPTS):
+        try:
+            cached = _rgc.try_load(store)
+        except Exception:  # noqa: BLE001 -- never let cache I/O break the build
+            cached = None
+
+        # Cache HIT: no contention risk, run directly (the impl reloads cheaply).
+        if cached is not None and cached[0] is not None:
+            return _build_runtime_graph_impl(store, cached)
+
+        # Cache MISS: single-flight on the cache key so a WAKE burst of callers
+        # does not all recompute the full mosaic concurrently.
+        try:
+            keystr = repr(_rgc._cache_key(store))
+        except Exception:  # noqa: BLE001 -- if we can't key it, just compute
+            return _build_runtime_graph_impl(store, cached)
+
+        with _BRG_INFLIGHT_LOCK:
+            event = _BRG_INFLIGHT.get(keystr)
+            is_leader = event is None
+            if is_leader:
+                event = threading.Event()
+                _BRG_INFLIGHT[keystr] = event
+
+        if is_leader:
+            # Leader: compute (the impl saves the cache), then release followers.
+            try:
+                return _build_runtime_graph_impl(store, cached)
+            finally:
+                with _BRG_INFLIGHT_LOCK:
+                    # Only drop our own slot (a key shift could have replaced it).
+                    if _BRG_INFLIGHT.get(keystr) is event:
+                        _BRG_INFLIGHT.pop(keystr, None)
+                event.set()
+
+        # Follower: wait for the leader, then loop. Next iteration's try_load
+        # HITS if the leader saved; if the leader failed / the key shifted /
+        # the wait timed out, we re-contend and one follower becomes the next
+        # leader (sequential single-flight — never an N-way concurrent re-storm).
+        event.wait(timeout=_BRG_WAIT_TIMEOUT_SEC)
+
+    # Attempts exhausted (e.g. the leader keeps failing): compute directly as a
+    # last resort. Bounded, and still correct.
+    return _build_runtime_graph_impl(store, cached)
+
+
+def _build_runtime_graph_impl(store: MemoryStore, cached):
     from iai_mcp.community import detect_communities
     from iai_mcp.graph import MemoryGraph
     from iai_mcp.richclub import rich_club_nodes
@@ -457,7 +541,6 @@ def build_runtime_graph(store: MemoryStore):
 
     graph = MemoryGraph()
 
-    cached = runtime_graph_cache.try_load(store)
     assignment = None
     rich_club = None
     cached_node_payload: dict[str, dict] | None = None
