@@ -555,6 +555,19 @@ def _build_runtime_graph_impl(store: MemoryStore, cached):
         and len(cached_node_payload) == records_count
     )
 
+    if cached_node_payload is not None and len(cached_node_payload) > records_count:
+        # The cache holds MORE nodes than are live: records were tombstoned
+        # (dedup/erasure) since it was built, so the cached assignment/rich_club
+        # were computed over now-dead nodes -- drop them and recompute on the
+        # fresh live graph (rebuilt from the records table below, which already
+        # excludes tombstoned rows). Pure GROWTH (cache has FEWER nodes than live)
+        # must NOT drop them: the node set is still rebuilt fresh from the table
+        # (so new records are present and drift/parity stay correct), but
+        # detect_communities is not re-run, so a single insert is absorbed without
+        # an O(n^2) recompute -- the staleness-window contract.
+        assignment = None
+        rich_club = None
+
     if use_cached_payload:
         for nid, payload in cached_node_payload.items():
             graph.add_node(
@@ -579,6 +592,16 @@ def _build_runtime_graph_impl(store: MemoryStore, cached):
         decrypt_fail_unique: set[str] = set()
         for _, row in df.iterrows():
             if int(row.get("embedding_pending") or 0) != 0:
+                continue
+            # Exclude tombstoned (soft-deleted / deduped / erased) records from the
+            # runtime graph: they must not pollute communities, centrality, rich_club
+            # or the sigma topology audit, and including them keeps the node count out
+            # of sync with store.active_records_count() (the cache-validity anchor at
+            # line ~552), permanently invalidating the cache -> a full rebuild every
+            # wake. Matches active_records_count(): tombstoned_at IS NULL. Guard the
+            # pandas NaN case (NaN != NaN) so an all-live column is not skipped.
+            _tomb = row.get("tombstoned_at")
+            if _tomb is not None and not (isinstance(_tomb, float) and _tomb != _tomb) and str(_tomb).strip():
                 continue
             rid = UUID(row["id"])
             _comm_raw = row["community_id"]
@@ -662,9 +685,16 @@ def _build_runtime_graph_impl(store: MemoryStore, cached):
 
     edges_df = store.db.open_table("edges").to_pandas()
     for _, row in edges_df.iterrows():
+        # Skip edges whose endpoints are not live nodes: graph.add_edge() does
+        # setdefault() on both endpoints, so an edge referencing a tombstoned record
+        # would re-create it as a payload-less node and undo the tombstone filter
+        # above (re-bloating the graph and the sigma audit).
+        src_s, dst_s = row["src"], row["dst"]
+        if not graph.has_node(src_s) or not graph.has_node(dst_s):
+            continue
         graph.add_edge(
-            UUID(row["src"]),
-            UUID(row["dst"]),
+            UUID(src_s),
+            UUID(dst_s),
             weight=float(row["weight"]),
             edge_type=row["edge_type"],
         )
