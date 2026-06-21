@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from itertools import combinations
 from uuid import UUID, uuid4
 
+import pandas as pd
+
 from iai_mcp.aaak import enforce_english_raw, generate_aaak_index
 from iai_mcp.events import query_events, write_event
 from iai_mcp.store import MemoryStore, flush_record_buffer
@@ -607,10 +609,19 @@ def _build_runtime_graph_impl(store: MemoryStore, cached):
             # or the sigma topology audit, and including them keeps the node count out
             # of sync with store.active_records_count() (the cache-validity anchor at
             # line ~552), permanently invalidating the cache -> a full rebuild every
-            # wake. Matches active_records_count(): tombstoned_at IS NULL. Guard the
-            # pandas NaN case (NaN != NaN) so an all-live column is not skipped.
+            # wake. Matches active_records_count(): tombstoned_at IS NULL.
+            #
+            # NULL is the LIVE case and pandas materialises it differently per
+            # dtype: None (object column), float('nan'), pd.NaT (a datetime64
+            # column -- the shape the reembed Arrow schema produces), or pd.NA
+            # (nullable extension dtypes). The old guard only caught float-NaN
+            # (`isinstance(float) and v != v`); a NaT/NA live value slipped past
+            # it, stringified to "NaT"/"<NA>", read truthy, and the LIVE record
+            # was wrongly dropped -- collapsing the whole graph to empty on a
+            # reembedded store. pd.isna() covers None/NaN/NaT/NA uniformly, so
+            # only a real timestamp string survives to mark a tombstone.
             _tomb = row.get("tombstoned_at")
-            if _tomb is not None and not (isinstance(_tomb, float) and _tomb != _tomb) and str(_tomb).strip():
+            if _tomb is not None and not pd.isna(_tomb) and str(_tomb).strip():
                 continue
             rid = UUID(row["id"])
             _comm_raw = row["community_id"]
