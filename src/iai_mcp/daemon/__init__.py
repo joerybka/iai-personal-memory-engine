@@ -228,8 +228,15 @@ def _store_is_empty(store: MemoryStore) -> bool:
     try:
         return store.db.open_table("records").count_rows() == 0
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
-        log.debug("store empty check failed, assuming empty: %s", exc)
-        return True
+        # Unknown != empty. A transient count failure (e.g. the shared sqlite
+        # connection left in an error state by a concurrent heavy reader, raising
+        # HippoIntegrityError/lock errors which subclass RuntimeError) must NOT be
+        # treated as an empty store: doing so parks the whole lifecycle tick
+        # (no idle-check, no drain) on a store that actually has records. Treat
+        # the unknown case as NOT empty so the tick proceeds; a truly empty store
+        # just does a little harmless no-op work.
+        log.debug("store empty check failed, assuming NOT empty: %s", exc)
+        return False
 
 
 def _is_inside_window(
