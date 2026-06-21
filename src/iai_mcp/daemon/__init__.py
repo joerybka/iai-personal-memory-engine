@@ -497,6 +497,10 @@ async def _tick_body(
 
 
     state["last_tick_at"] = datetime.now(timezone.utc).isoformat()
+    # Clear the skip reason: reaching here means the tick was NOT skipped. Leaving a
+    # stale "empty_store"/"paused" value here makes a healthy daemon look parked in
+    # observability (last_tick_skipped_reason is only ever set, never reset).
+    state["last_tick_skipped_reason"] = None
     try:
         await asyncio.to_thread(save_state, state)
     except (OSError, ValueError) as exc:
